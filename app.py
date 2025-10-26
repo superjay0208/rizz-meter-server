@@ -138,7 +138,7 @@ def send_notification(uid: str, title: str, body: str):
 
 # --- 6. UPDATED WEBHOOK ENDPOINT (Unchanged from last time) ---
 # This part is the same as our last version.
-@app.post("/rizz-meter")
+@app.post("/memory_created")
 async def analyze_memory(memory: Memory, uid: str):
     print(f"🎉 Analyzing Memory: {memory.structured.title} for user: {uid}")
     
@@ -175,3 +175,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     print(f"Starting Rizz Meter server on http://0.0.0.0:{port}")
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)
+
