@@ -4,6 +4,7 @@ import json
 from pydantic import BaseModel, Field
 from typing import List, Optional
 import requests  # <-- 1. IMPORT THE NEW LIBRARY
+import os
 
 # --- Data Models (Unchanged) ---
 class TranscriptSegment(BaseModel):
@@ -175,3 +176,4 @@ if __name__ == "__main__":
     print("Starting Rizz Meter server on http://localhost:8000")
 
     uvicorn.run("app:app", host="0.0.0.0", port=10000, reload=True)
+
