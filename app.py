@@ -93,7 +93,7 @@ def analyze_comfort(segments: List[TranscriptSegment]):
 # !! IMPORTANT !!
 # You get this key from the Omi developer portal when you
 # register your app. This is just a placeholder.
-OMI_API_KEY = "YOUR_APP_API_KEY_GOES_HERE"
+OMI_API_KEY = OMI_API_KEY = os.environ.get("OMI_API_KEY")
 NOTIFICATION_URL = "https://api.omi.me/v1/notifications"
 
 def send_notification(uid: str, title: str, body: str):
@@ -173,4 +173,5 @@ async def analyze_memory(memory: Memory, uid: str): # <-- 2. 'uid: str' IS NEW
 # --- Run Server (Unchanged) ---
 if __name__ == "__main__":
     print("Starting Rizz Meter server on http://localhost:8000")
+
     uvicorn.run("app:app", host="0.0.0.0", port=10000, reload=True)
