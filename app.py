@@ -334,11 +334,42 @@ def send_notification(uid: str, title: str, body: str):
         print(f"Error sending notification: {e}")
 
 def compose_notification(memory_title: str, final: int, metrics: Dict[str, Dict], strengths: List[str], tips: List[str]) -> str:
-    br = {"R": metrics["Reciprocity"]["score"], "A": metrics["Attentiveness"]["score"], "W": metrics["Warmth"]["score"], "C": metrics["Comfort"]["score"], "B": metrics["Boundary"]["score"], "Ch": metrics["Chemistry"]["score"]}
-    breakdown = f'R{br["R"]}/A{br["A"]}/W{br["W"]}/C{br["C"]}/B{br["B"]}/Ch{br["Ch"]}'
-    hi = ("; ".join(strengths)) or "Nice effort!"
-    im = ("; ".join(tips)) or "Keep doing what felt natural."
-    return f'Date Rizz {final}/100 for “{memory_title}”. {breakdown}. Highlights: {hi}. Try: {im}'
+    def truncate(s: str, n: int = 60) -> str:
+        return (s[:n].rstrip() + "…") if len(s) > n else s
+
+    br = {
+        "R": metrics["Reciprocity"]["score"],
+        "A": metrics["Attentiveness"]["score"],
+        "W": metrics["Warmth"]["score"],
+        "C": metrics["Comfort"]["score"],
+        "B": metrics["Boundary"]["score"],
+        "Ch": metrics["Chemistry"]["score"],
+    }
+
+    breakdown = f"R {br['R']} · A {br['A']} · W {br['W']} · C {br['C']} · B {br['B']} · Ch {br['Ch']}"
+    hi = " • ".join(strengths) if strengths else "Nice effort!"
+    im = " • ".join(tips) if tips else "Keep doing what felt natural."
+
+    title_snippet = truncate(memory_title, 60)
+
+    body_multiline = (
+        f"Date Rizz: {final}/100 — “{title_snippet}”\n"
+        f"{breakdown}\n"
+        f"✅ Highlights: {hi}\n"
+        f"💡 Try: {im}"
+    )
+
+    # Fallback to compact single-line if your push client strips newlines
+    if len(body_multiline) > 500:
+        body_compact = (
+            f"Date Rizz {final}/100 — “{title_snippet}”. "
+            f"{breakdown}. "
+            f"Highlights: {hi}. "
+            f"Try: {im}"
+        )
+        return body_compact
+
+    return body_multiline
 
 @app.post("/memory_created")
 async def analyze_memory(memory: Memory, uid: str):
@@ -367,3 +398,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     print(f"Starting Rizz Meter server on http://0.0.0.0:{port}")
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)
+
