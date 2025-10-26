@@ -3,10 +3,16 @@ from fastapi import FastAPI, Request
 import json
 from pydantic import BaseModel, Field
 from typing import List, Optional
-import requests  # <-- 1. IMPORT THE NEW LIBRARY
-import os
+import requests
+import os  # <-- Make sure 'os' is imported
 
-# --- Data Models (Unchanged) ---
+# --- 1. Get Secure Keys from Environment (Updated) ---
+# We now get BOTH keys from Render's environment
+OMI_APP_ID = os.environ.get("OMI_APP_ID")
+OMI_APP_SECRET = os.environ.get("OMI_APP_SECRET")
+
+
+# --- 2. Data Models (Unchanged) ---
 class TranscriptSegment(BaseModel):
     text: str
     speaker: str
@@ -19,7 +25,7 @@ class StructuredMemory(BaseModel):
     emoji: str
     
 class Memory(BaseModel):
-    id: str  # We keep this as 'str' from our last fix
+    id: str
     started_at: str
     finished_at: str
     transcript_segments: List[TranscriptSegment]
@@ -27,16 +33,14 @@ class Memory(BaseModel):
     apps_response: Optional[List[dict]] = Field(alias="apps_response", default=[])
 
 
-# --- Initialize App (Unchanged) ---
+# --- 3. Initialize App (Unchanged) ---
 app = FastAPI(title="Rizz Meter Server")
 
 
-# --- Analysis Functions (Unchanged) ---
-# (All your functions like analyze_reciprocity, analyze_attentiveness, etc.
-#  go here. I'm omitting them for brevity, but you should
-#  paste them in from your last file.)
+# --- 4. Analysis Helper Functions (Unchanged) ---
+# (Paste all your `analyze_...` functions here. I've re-included them.)
+
 def analyze_reciprocity(segments: List[TranscriptSegment]):
-    # ... (paste your code here)
     talk_time = {}
     for seg in segments:
         duration = seg.end - seg.start
@@ -53,7 +57,6 @@ def analyze_reciprocity(segments: List[TranscriptSegment]):
     return {"score": round(reciprocity_score), "balance": f"{round(balance * 100)}% / {round((1-balance) * 100)}%"}
 
 def analyze_attentiveness(segments: List[TranscriptSegment]):
-    # ... (paste your code here)
     questions = {}
     for seg in segments:
         if seg.speaker not in questions: questions[seg.speaker] = 0
@@ -63,7 +66,6 @@ def analyze_attentiveness(segments: List[TranscriptSegment]):
     return {"score": score, "total_questions": total_questions, "breakdown": questions}
 
 def analyze_warmth(segments: List[TranscriptSegment]):
-    # ... (paste your code here)
     POSITIVE_WORDS = ["great", "awesome", "cool", "love", "amazing", "thank you", "thanks", "wonderful", "fantastic"]
     warmth_count = 0
     for seg in segments:
@@ -74,7 +76,6 @@ def analyze_warmth(segments: List[TranscriptSegment]):
     return {"score": score, "positive_word_count": warmth_count}
 
 def analyze_comfort(segments: List[TranscriptSegment]):
-    # ... (paste your code here)
     pauses = []
     if len(segments) < 2: return {"score": 50, "average_pause_s": 0}
     for i in range(1, len(segments)):
@@ -87,39 +88,46 @@ def analyze_comfort(segments: List[TranscriptSegment]):
     if avg_pause < 1.0: score = (avg_pause / 1.0) * 100
     else: score = max(0, (1 - (avg_pause - 1.0) / 2.0)) * 100
     return {"score": round(score), "average_pause_s": round(avg_pause, 2)}
-    
 
-# --- 3. NEW NOTIFICATION FUNCTION ---
 
-# !! IMPORTANT !!
-# You get this key from the Omi developer portal when you
-# register your app. This is just a placeholder.
-OMI_API_KEY = OMI_API_KEY = os.environ.get("OMI_API_KEY")
-NOTIFICATION_URL = "https://api.omi.me/v1/notifications"
+# --- 5. NEW NOTIFICATION FUNCTION (The Fix) ---
 
 def send_notification(uid: str, title: str, body: str):
     """
-    Sends a push notification to a specific user via the Omi API.
+    Sends a direct notification to an Omi user
+    using the v2 /integrations API.
     """
-    print(f"Attempting to send notification to user: {uid}")
+    print(f"Attempting to send v2 notification to user: {uid}")
+    
+    if not OMI_APP_ID or not OMI_APP_SECRET:
+        print("❌ CRITICAL ERROR: OMI_APP_ID or OMI_APP_SECRET is not set in environment.")
+        return
+
+    # Per the docs, the message is a combination of title and body
+    full_message = f"{title}: {body}"
+
+    # Build the URL and headers as specified in the documentation
+    notification_url = f"https://api.omi.me/v2/integrations/{OMI_APP_ID}/notification"
     
     headers = {
-        "Authorization": f"Bearer {OMI_API_KEY}",
-        "Content-Type": "application/json"
+        "Authorization": f"Bearer {OMI_APP_SECRET}",
+        "Content-Type": "application/json",
+        "Content-Length": "0"  # <-- This is the strange but required part
     }
     
-    payload = {
+    # Per the docs, data is sent as query parameters
+    params = {
         "uid": uid,
-        "title": title,
-        "body": body
+        "message": full_message
     }
     
     try:
-        response = requests.post(NOTIFICATION_URL, headers=headers, json=payload)
+        # Note: We send an empty `data` payload because Content-Length is 0
+        response = requests.post(notification_url, headers=headers, params=params, data="")
         
-        # Check if the request was successful
-        if response.status_code == 200:
+        if 200 <= response.status_code < 300:
             print("✅ Notification sent successfully!")
+            print(f"Response: {response.text}")
         else:
             print(f"❌ Failed to send notification. Status: {response.status_code}")
             print(f"Response body: {response.text}")
@@ -128,15 +136,10 @@ def send_notification(uid: str, title: str, body: str):
         print(f"Error sending notification: {e}")
 
 
-# --- 4. UPDATED WEBHOOK ENDPOINT ---
-
+# --- 6. UPDATED WEBHOOK ENDPOINT (Unchanged from last time) ---
+# This part is the same as our last version.
 @app.post("/rizz-meter")
-async def analyze_memory(memory: Memory, uid: str): # <-- 2. 'uid: str' IS NEW
-    """
-    This function will be called every time Omi sends
-    a new memory. It now ALSO captures the 'uid' from
-    the URL (e.g., /rizz-meter?uid=user-123)
-    """
+async def analyze_memory(memory: Memory, uid: str):
     print(f"🎉 Analyzing Memory: {memory.structured.title} for user: {uid}")
     
     segments = memory.transcript_segments
@@ -145,35 +148,30 @@ async def analyze_memory(memory: Memory, uid: str): # <-- 2. 'uid: str' IS NEW
         print("Not enough segments to analyze.")
         return {"status": "error", "message": "Not enough segments."}
 
-    # Run all our analyses (unchanged)
     reciprocity = analyze_reciprocity(segments)
     attentiveness = analyze_attentiveness(segments)
     warmth = analyze_warmth(segments)
     comfort = analyze_comfort(segments)
     
-    # Calculate final score (unchanged)
     final_score = (
         reciprocity.get('score', 0) +
         attentiveness.get('score', 0) +
         warmth.get('score', 0) +
         comfort.get('score', 0)
     ) / 4
-    
-    # --- 5. CALL THE NOTIFICATION FUNCTION ---
-    # Instead of just printing, we now send the notification.
-    
+
     report_title = "Your Rizz Report is Ready!"
     report_body = f"Your final score for '{memory.structured.title}' is {round(final_score)}/100."
     
+    # Call our new, correct notification function
     send_notification(uid, title=report_title, body=report_body)
     
-    # We'll return a simple success message
     return {"status": "success", "message_sent": report_body}
 
 
-# --- Run Server (Unchanged) ---
+# --- 7. Run Server (Unchanged) ---
 if __name__ == "__main__":
-    print("Starting Rizz Meter server on http://localhost:8000")
-
-    uvicorn.run("app:app", host="0.0.0.0", port=10000, reload=True)
-
+    # Use port 10000 for Render
+    port = int(os.environ.get("PORT", 10000))
+    print(f"Starting Rizz Meter server on http://0.0.0.0:{port}")
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)
