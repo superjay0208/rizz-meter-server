@@ -2,4 +2,9 @@ fastapi
 uvicorn
 gunicorn
 requests
+
 pydantic
+
+transformers
+torch
+nltk
