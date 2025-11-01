@@ -5,6 +5,3 @@ requests
 
 pydantic
 
-transformers
-torch
-nltk
