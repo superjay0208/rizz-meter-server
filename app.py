@@ -1,15 +1,29 @@
+import os
+import re
+import math
+import asyncio
+import statistics
+import requests
 import uvicorn
+from datetime import datetime, timezone
+from typing import List, Optional, Dict, Tuple
 from fastapi import FastAPI, Query
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Tuple
-import requests, os, re, math, statistics, asyncio
-from datetime import datetime
 
+# =========================
+# Env / constants
+# =========================
 OMI_APP_ID = os.environ.get("OMI_APP_ID")
 OMI_APP_SECRET = os.environ.get("OMI_APP_SECRET")
 
+# Auto-finalization knobs
+IDLE_TIMEOUT_SEC = int(os.environ.get("IDLE_TIMEOUT_SEC", "180"))   # wall-clock idle -> finalize on next batch
+MAX_SEG_GAP_SEC = float(os.environ.get("MAX_SEG_GAP_SEC", "120"))   # audio timeline gap -> finalize on next batch
+
+PID = os.getpid()
+
 # =========================
-# Existing models (unchanged)
+# Base models (memory_created)
 # =========================
 class TranscriptSegment(BaseModel):
     text: str
@@ -31,7 +45,7 @@ class Memory(BaseModel):
     apps_response: Optional[List[dict]] = Field(alias="apps_response", default=[])
 
 # =========================
-# New RT payload models
+# Real-time payload models
 # =========================
 class RTIncomingSegment(BaseModel):
     id: Optional[str] = None
@@ -47,13 +61,13 @@ class RTIncomingSegment(BaseModel):
 
 class RTTranscriptBatch(BaseModel):
     segments: List[RTIncomingSegment]
-    session_id: Optional[str] = None   # <-- now treated as uid fallback
-    uid: Optional[str] = None          # optional uid in body
+    session_id: Optional[str] = None   # treated as uid fallback
+    uid: Optional[str] = None          # accepted too
 
 app = FastAPI(title="Rizz Meter Server")
 
 # =========================
-# Optional NLP backends
+# Optional NLP
 # =========================
 HF_PIPELINE = None
 VADER = None
@@ -78,9 +92,9 @@ LAUGHTER_PATTERNS = [r"\b(lol|haha|lmao|rofl|\[laughs\]|(ha){2,})\b"]
 BACKCHANNELS = {"yeah","uh-huh","mm-hmm","right","gotcha","i see","ok","okay","mhmm","yup"}
 BOUNDARY_PHRASES = [r"\b(not comfortable|don’t want to talk|rather not|can we change the topic|let’s change the topic|no, thanks)\b"]
 
-# Start/End markers (case-insensitive) and common typo tolerance
+# Start / End markers — broader & case-insensitive
 START_RE = re.compile(r"\bconversation\s*starts\b", re.I)
-END_RE   = re.compile(r"\bconversa(?:i?t)ion\s*ends\b", re.I)  # "conversation ends" or "conversaition ends"
+END_RE   = re.compile(r"\bconversa(?:i?t)ion\s*end(?:s)?\b", re.I)  # matches 'conversation end'/'ends' + typo 'conversaition'
 
 def clamp01(x: float) -> float:
     return max(0.0, min(1.0, x))
@@ -95,10 +109,6 @@ def contains_any(text: str, patterns: List[str]) -> bool:
     tl = text.lower()
     return any(re.search(p, tl) for p in patterns)
 
-def count_matches(text: str, patterns: List[str]) -> int:
-    tl = text.lower()
-    return sum(1 for p in patterns if re.search(p, tl))
-
 def avg(lst: List[float]) -> float:
     return sum(lst)/len(lst) if lst else 0.0
 
@@ -106,7 +116,7 @@ def safe_var(lst: List[float]) -> float:
     return statistics.pvariance(lst) if len(lst) >= 2 else 0.0
 
 # =========================
-# Analytics (unchanged)
+# Analytics (same as before)
 # =========================
 def analyze_reciprocity(segments: List[TranscriptSegment]) -> Dict:
     talk_time: Dict[str, float] = {}
@@ -346,17 +356,20 @@ def compute_final_score(metrics: Dict[str, Dict]) -> int:
         total += w * s
     return int(round(total))
 
+# =========================
+# Push helpers
+# =========================
 def send_notification(uid: str, title: str, body: str):
-    print(f"Attempting to send v2 notification to user: {uid}")
+    print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) Attempting push to uid={uid}")
     if not OMI_APP_ID or not OMI_APP_SECRET:
         print("❌ CRITICAL ERROR: OMI_APP_ID or OMI_APP_SECRET is not set.")
         return
     full_message = f"{title}: {body}"
-    notification_url = f"https://api.omi.me/v2/integrations/{OMI_APP_ID}/notification"
+    url = f"https://api.omi.me/v2/integrations/{OMI_APP_ID}/notification"
     headers = {"Authorization": f"Bearer {OMI_APP_SECRET}", "Content-Type": "application/json", "Content-Length": "0"}
     params = {"uid": uid, "message": full_message}
     try:
-        resp = requests.post(notification_url, headers=headers, params=params, data="")
+        resp = requests.post(url, headers=headers, params=params, data="")
         if 200 <= resp.status_code < 300:
             print("✅ Notification sent.")
             print(f"Response: {resp.text}")
@@ -366,7 +379,7 @@ def send_notification(uid: str, title: str, body: str):
     except Exception as e:
         print(f"Error sending notification: {e}")
 
-def compose_notification(memory_title: str, final: int, metrics: Dict[str, Dict], strengths: List[str], tips: List[str]) -> str:
+def compose_notification(title: str, final: int, metrics: Dict[str, Dict], strengths: List[str], tips: List[str]) -> str:
     def truncate(s: str, n: int = 60) -> str:
         return (s[:n].rstrip() + "…") if len(s) > n else s
     br = {
@@ -380,25 +393,33 @@ def compose_notification(memory_title: str, final: int, metrics: Dict[str, Dict]
     breakdown = f"R {br['R']} · A {br['A']} · W {br['W']} · C {br['C']} · B {br['B']} · Ch {br['Ch']}"
     hi = " • ".join(strengths) if strengths else "Nice effort!"
     im = " • ".join(tips) if tips else "Keep doing what felt natural."
-    title_snippet = truncate(memory_title, 60)
-    body_multiline = (
-        f"Date Rizz: {final}/100 — “{title_snippet}”\n"
+    tsn = truncate(title or "Conversation", 60)
+    body = (
+        f"Date Rizz: {final}/100 — “{tsn}”\n"
         f"{breakdown}\n"
         f"✅ Highlights: {hi}\n"
         f"💡 Try: {im}"
     )
-    if len(body_multiline) > 500:
-        return f"Date Rizz {final}/100 — “{title_snippet}”. {breakdown}. Highlights: {hi}. Try: {im}"
-    return body_multiline
+    return body if len(body) <= 500 else f"Date Rizz {final}/100 — “{tsn}”. {breakdown}. Highlights: {hi}. Try: {im}"
 
 # =========================
-# Real-time state
+# Per-uid state
 # =========================
-ACTIVE: bool = False
-BUFFER: List[TranscriptSegment] = []
-TITLE: Optional[str] = None
-LAST_UID: Optional[str] = None
-STATE_LOCK = asyncio.Lock()
+class ConvState:
+    def __init__(self):
+        self.active: bool = False
+        self.buffer: List[TranscriptSegment] = []
+        self.title: Optional[str] = None
+        self.last_uid: Optional[str] = None
+        self.last_wall_ts: float = 0.0    # wall-clock timestamp of last activity
+        self.last_seg_end: float = 0.0    # last audio timeline end
+        self.lock = asyncio.Lock()
+
+    def touch_wall(self):
+        self.last_wall_ts = datetime.now(timezone.utc).timestamp()
+
+CONVS: Dict[str, ConvState] = {}
+CONVS_LOCK = asyncio.Lock()
 
 def _normalize_speaker(seg: RTIncomingSegment) -> str:
     if seg.is_user is True:
@@ -425,135 +446,190 @@ def _is_start_marker(txt: str) -> bool:
 def _is_end_marker(txt: str) -> bool:
     return bool(END_RE.search(txt or ""))
 
-async def _finalize_and_analyze(uid: Optional[str]) -> Dict:
-    global ACTIVE, BUFFER, TITLE, LAST_UID
-    segments = BUFFER[:]
-    print(f"[{datetime.utcnow().isoformat()}Z] 🔚 End marker received. Collected {len(segments)} segments. Running analysis...")
+async def _get_state(uid: str) -> ConvState:
+    async with CONVS_LOCK:
+        if uid not in CONVS:
+            CONVS[uid] = ConvState()
+        return CONVS[uid]
 
-    # Title from first non-marker content
-    def non_marker_texts():
-        for s in segments:
-            if not _is_start_marker(s.text) and not _is_end_marker(s.text):
-                t = s.text.strip()
-                if t:
-                    yield t
-    title = TITLE or next((t[:60] for t in non_marker_texts()), "Conversation")
+async def _finalize_and_analyze(uid: str) -> Dict:
+    state = await _get_state(uid)
+    async with state.lock:
+        segs = list(state.buffer)
+        print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🔔 Finalizing uid={uid} with {len(segs)} segments")
 
-    clean_segments = [s for s in segments if not _is_start_marker(s.text) and not _is_end_marker(s.text)]
+        def non_marker_texts():
+            for s in segs:
+                if not _is_start_marker(s.text) and not _is_end_marker(s.text):
+                    t = s.text.strip()
+                    if t:
+                        yield t
+        title = state.title or next((t[:60] for t in non_marker_texts()), "Conversation")
+        clean_segments = [s for s in segs if not _is_start_marker(s.text) and not _is_end_marker(s.text)]
 
-    if len(clean_segments) < 2:
-        print(f"[{datetime.utcnow().isoformat()}Z] ⚠️ Not enough segments to analyze.")
-        summary = {"status": "error", "message": "Not enough segments to analyze."}
-    else:
-        reciprocity = analyze_reciprocity(clean_segments)
-        interruptions = analyze_interruptions(clean_segments)
-        backchannels = analyze_backchannels(clean_segments)
-        attentiveness = analyze_attentiveness(clean_segments)
-        followups = analyze_followups(clean_segments)
-        warmth = analyze_sentiment(clean_segments)
-        comfort = analyze_comfort(clean_segments)
-        boundary = analyze_boundary_respect(clean_segments)
-        chemistry = analyze_chemistry(clean_segments)
-        metrics = {"Reciprocity": reciprocity, "Interruptions": interruptions, "Backchannels": backchannels, "Attentiveness": attentiveness, "FollowUps": followups, "Warmth": warmth, "Comfort": comfort, "Boundary": boundary, "Chemistry": chemistry}
-        final_score = compute_final_score(metrics)
-        strengths, tips = summarize_strengths_and_tips(metrics)
-        report_title = "Your Rizz Report is Ready"
-        report_body = compose_notification(title, final_score, metrics, strengths, tips)
-
-        real_uid = uid or LAST_UID
-        if real_uid:
-            print(f"[{datetime.utcnow().isoformat()}Z] 📣 Sending push to uid='{real_uid}' with score {final_score}.")
-            send_notification(real_uid, title=report_title, body=report_body)
+        if len(clean_segments) < 2:
+            print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ⚠️ Not enough segments to analyze (uid={uid}).")
+            summary = {"status": "error", "message": "Not enough segments to analyze."}
         else:
-            print(f"[{datetime.utcnow().isoformat()}Z] 🔕 No uid available — skipping push")
-
-        print(f"[{datetime.utcnow().isoformat()}Z] ✅ Analysis complete. Final score: {final_score}")
-        summary = {
-            "status": "success",
-            "summary": {
-                "title": title,
-                "final_score": final_score,
-                "subscores": {
-                    "reciprocity": reciprocity, "attentiveness": attentiveness, "warmth": warmth,
-                    "comfort": comfort, "boundary": boundary, "chemistry": chemistry
-                },
-                "supporting_signals": {
-                    "interruptions": interruptions, "backchannels": backchannels, "followups": followups
-                },
-                "highlights": strengths,
-                "improvements": tips,
-                "generated_at": datetime.utcnow().isoformat() + "Z"
+            # analytics
+            reciprocity = analyze_reciprocity(clean_segments)
+            interruptions = analyze_interruptions(clean_segments)
+            backchannels = analyze_backchannels(clean_segments)
+            attentiveness = analyze_attentiveness(clean_segments)
+            followups = analyze_followups(clean_segments)
+            warmth = analyze_sentiment(clean_segments)
+            comfort = analyze_comfort(clean_segments)
+            boundary = analyze_boundary_respect(clean_segments)
+            chemistry = analyze_chemistry(clean_segments)
+            metrics = {
+                "Reciprocity": reciprocity, "Interruptions": interruptions, "Backchannels": backchannels,
+                "Attentiveness": attentiveness, "FollowUps": followups, "Warmth": warmth,
+                "Comfort": comfort, "Boundary": boundary, "Chemistry": chemistry
             }
-        }
+            final_score = compute_final_score(metrics)
+            strengths, tips = summarize_strengths_and_tips(metrics)
+            body = compose_notification(title, final_score, metrics, strengths, tips)
+            push_uid = state.last_uid or uid
+            if push_uid:
+                print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 📣 Pushing to uid='{push_uid}', score={final_score}")
+                send_notification(push_uid, title="Your Rizz Report is Ready", body=body)
+            else:
+                print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🔕 No uid to push")
 
-    # reset state
-    ACTIVE = False
-    BUFFER = []
-    TITLE = None
-    LAST_UID = None
-    return summary
+            summary = {
+                "status": "success",
+                "summary": {
+                    "title": title,
+                    "final_score": final_score,
+                    "subscores": {
+                        "reciprocity": reciprocity, "attentiveness": attentiveness, "warmth": warmth,
+                        "comfort": comfort, "boundary": boundary, "chemistry": chemistry
+                    },
+                    "supporting_signals": {
+                        "interruptions": interruptions, "backchannels": backchannels, "followups": followups
+                    },
+                    "highlights": strengths,
+                    "improvements": tips,
+                    "generated_at": datetime.now(timezone.utc).isoformat()
+                }
+            }
+
+        # reset state
+        state.active = False
+        state.buffer = []
+        state.title = None
+        state.last_uid = None
+        state.touch_wall()
+        state.last_seg_end = 0.0
+        return summary
 
 # =========================
 # Endpoints
 # =========================
 @app.get("/")
 async def health():
-    return {"status": "ok", "omi_creds_loaded": bool(OMI_APP_ID and OMI_APP_SECRET)}
+    return {"status": "ok", "omi_creds_loaded": bool(OMI_APP_ID and OMI_APP_SECRET), "pid": PID}
 
 @app.post("/transcript_processed")
-async def transcript_processed(batch: RTTranscriptBatch, uid: Optional[str] = Query(None)):
+async def transcript_processed(
+    batch: RTTranscriptBatch,
+    uid: Optional[str] = Query(None),
+    force_start: Optional[int] = Query(0),
+    force_end: Optional[int] = Query(0),
+):
     """
-    Real-time handler. Start when a segment text contains "conversation starts" (any case).
-    End when a segment text contains "conversation ends" / "conversaition ends" (any case).
-    Uses uid from: body.uid, query ?uid=, or session_id (in that order).
+    Real-time ingest.
+    - uid read from: body.uid -> query ?uid= -> session_id
+    - Start on text 'conversation starts' (case-insensitive)
+      OR if ?force_start=1 is passed.
+    - End on 'conversation end'/'ends'/'conversaition ends'
+      OR if ?force_end=1 is passed.
+    - Auto-finalize if either:
+        * wall-clock idle > IDLE_TIMEOUT_SEC (finalize on next batch), or
+        * audio timeline gap > MAX_SEG_GAP_SEC (finalize on next batch).
     """
-    global ACTIVE, BUFFER, TITLE, LAST_UID
-    if not batch.segments:
-        return {"status": "ignored", "reason": "no_segments"}
+    if not batch.segments and not force_end and not force_start:
+        return {"status": "ignored", "reason": "no_segments", "pid": PID}
 
-    # uid resolution: body -> query -> session_id
     effective_uid = batch.uid or uid or batch.session_id
-    if effective_uid:
-        LAST_UID = effective_uid
-        source = "body.uid" if batch.uid else ("query.uid" if uid else "session_id")
-        print(f"[{datetime.utcnow().isoformat()}Z] 🔗 uid set from {source}: {effective_uid}")
+    if not effective_uid:
+        return {"status": "ignored", "reason": "missing_uid(session_id/body/query)", "pid": PID}
 
-    async with STATE_LOCK:
-        has_start = any(_is_start_marker(s.text) for s in batch.segments)
-        has_end   = any(_is_end_marker(s.text) for s in batch.segments)
+    state = await _get_state(effective_uid)
+    state.last_uid = effective_uid
+    source = "body.uid" if batch.uid else ("query.uid" if uid else "session_id")
+    print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🔗 uid set from {source}: {effective_uid}")
 
-        if has_start:
-            ACTIVE = True
-            BUFFER = []
-            TITLE = None
-            print(f"[{datetime.utcnow().isoformat()}Z] 🟢 conversation starts — buffering begins")
+    # Detect markers in this batch
+    has_start = any(_is_start_marker(s.text) for s in (batch.segments or []))
+    has_end   = any(_is_end_marker(s.text) for s in (batch.segments or []))
 
-        if not ACTIVE:
-            print(f"[{datetime.utcnow().isoformat()}Z] ⏸️ Batch ignored: conversation not started yet.")
-            return {"status": "ignored", "reason": "not_started"}
+    async with state.lock:
+        now_ts = datetime.now(timezone.utc).timestamp()
 
-        for seg in batch.segments:
+        # Soft auto-finalize if previously active and idle too long (handled on arrival of any new batch)
+        if state.active and state.last_wall_ts and (now_ts - state.last_wall_ts > IDLE_TIMEOUT_SEC) and state.buffer:
+            print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ⏰ Idle timeout (wall) for uid={effective_uid}. Auto-finalizing previous convo.")
+            await _finalize_and_analyze(effective_uid)
+
+        # Manual overrides
+        if force_end:
+            print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🛑 force_end received for uid={effective_uid}")
+            return await _finalize_and_analyze(effective_uid)
+
+        if has_start or force_start:
+            if state.active and state.buffer:
+                print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🔄 start while active (uid={effective_uid}) — auto-finalizing previous.")
+                await _finalize_and_analyze(effective_uid)
+            state.active = True
+            state.buffer = []
+            state.title = None
+            state.last_seg_end = 0.0
+            print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🟢 conversation starts — buffering begins (uid={effective_uid})")
+
+        if not state.active:
+            print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ⏸️ Batch ignored: conversation not started yet. (uid={effective_uid})")
+            state.touch_wall()
+            return {"status": "ignored", "reason": "not_started", "pid": PID}
+
+        # Buffer incoming segments and check audio timeline gaps
+        audio_gap_trigger = False
+        for seg in batch.segments or []:
             internal = _rt_to_internal(seg)
-            if TITLE is None and internal.text.strip() and not _is_start_marker(internal.text) and not _is_end_marker(internal.text):
-                TITLE = internal.text.strip()[:60]
-            BUFFER.append(internal)
+            # conversation title from first non-marker text
+            if state.title is None and internal.text.strip() and not _is_start_marker(internal.text) and not _is_end_marker(internal.text):
+                state.title = internal.text.strip()[:60]
+
+            # detect audio gap from last_seg_end
+            if state.last_seg_end and (internal.end - state.last_seg_end) > MAX_SEG_GAP_SEC:
+                audio_gap_trigger = True
+            state.last_seg_end = max(state.last_seg_end, internal.end)
+
+            state.buffer.append(internal)
+
+        state.touch_wall()
 
         if has_end:
-            print(f"[{datetime.utcnow().isoformat()}Z] 🟥 end marker detected — finalizing")
-            return await _finalize_and_analyze(uid=effective_uid)
+            print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🟥 end marker detected — finalizing (uid={effective_uid})")
+            return await _finalize_and_analyze(effective_uid)
 
-        print(f"[{datetime.utcnow().isoformat()}Z] 🔄 Buffering: total segments={len(BUFFER)}")
-        return {
-            "status": "buffering",
-            "segments_buffered": len(BUFFER),
-            "will_push_on_end": bool(LAST_UID),
-            "uid_source": ("body.uid" if batch.uid else ("query.uid" if uid else ("session_id" if batch.session_id else None)))
-        }
+        if audio_gap_trigger and state.buffer:
+            print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ⏰ Large audio gap detected (> {MAX_SEG_GAP_SEC}s). Auto-finalizing (uid={effective_uid}).")
+            return await _finalize_and_analyze(effective_uid)
 
-# ---- Back-compat endpoint (unchanged) ----
+        print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🔄 Buffering: total segments={len(state.buffer)} (uid={effective_uid})")
+        return {"status": "buffering", "segments_buffered": len(state.buffer), "will_push_on_end": True, "pid": PID}
+
+# Manual end endpoint (handy if markers were missed)
+@app.post("/conversation/end")
+async def conversation_end(uid: str = Query(...)):
+    print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🛑 /conversation/end called for uid={uid}")
+    return await _finalize_and_analyze(uid)
+
+# Back-compat endpoint (memory_created)
 @app.post("/memory_created")
 async def analyze_memory(memory: Memory, uid: str):
-    print(f"🎉 Analyzing Memory: {memory.structured.title} for user: {uid}")
+    print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🎉 Analyzing Memory: {memory.structured.title} for uid: {uid}")
     segments = memory.transcript_segments
     if len(segments) < 2:
         return {"status": "error", "message": "Not enough segments."}
@@ -569,15 +645,15 @@ async def analyze_memory(memory: Memory, uid: str):
     metrics = {"Reciprocity": reciprocity, "Interruptions": interruptions, "Backchannels": backchannels, "Attentiveness": attentiveness, "FollowUps": followups, "Warmth": warmth, "Comfort": comfort, "Boundary": boundary, "Chemistry": chemistry}
     final_score = compute_final_score(metrics)
     strengths, tips = summarize_strengths_and_tips(metrics)
-    report_title = "Your Rizz Report is Ready"
-    report_body = compose_notification(memory.structured.title, final_score, metrics, strengths, tips)
-    send_notification(uid, title=report_title, body=report_body)
-    return {"status": "success", "summary": {"title": memory.structured.title, "final_score": final_score, "subscores": {"reciprocity": reciprocity, "attentiveness": attentiveness, "warmth": warmth, "comfort": comfort, "boundary": boundary, "chemistry": chemistry}, "supporting_signals": {"interruptions": interruptions, "backchannels": backchannels, "followups": followups}, "highlights": strengths, "improvements": tips, "generated_at": datetime.utcnow().isoformat() + "Z"}}
+    body = compose_notification(memory.structured.title, final_score, metrics, strengths, tips)
+    send_notification(uid, title="Your Rizz Report is Ready", body=body)
+    return {"status": "success", "summary": {"title": memory.structured.title, "final_score": final_score, "subscores": {"reciprocity": reciprocity, "attentiveness": attentiveness, "warmth": warmth, "comfort": comfort, "boundary": boundary, "chemistry": chemistry}, "supporting_signals": {"interruptions": interruptions, "backchannels": backchannels, "followups": followups}, "highlights": strengths, "improvements": tips, "generated_at": datetime.now(timezone.utc).isoformat()}}
 
 # =========================
 # Entrypoint
 # =========================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    print(f"Starting Rizz Meter server on http://0.0.0.0:{port}")
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)
+    print(f"Starting Rizz Meter server on http://0.0.0.0:{port} (pid={PID})")
+    # Keep single worker in prod to avoid split memory problems, or persist state to Redis/DB if you need >1.
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
