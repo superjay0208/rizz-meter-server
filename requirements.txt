@@ -4,4 +4,8 @@ gunicorn
 requests
 
 pydantic
+# ML Models
+transformers
+torch
+nltk
 
