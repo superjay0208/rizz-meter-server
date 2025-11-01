@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import List, Optional, Dict, Tuple
 from fastapi import FastAPI, Query
 from pydantic import BaseModel, Field
+from contextlib import asynccontextmanager  # <-- FIX 1: IMPORT
 
 # =========================
 # Env / constants
@@ -17,8 +18,8 @@ OMI_APP_ID = os.environ.get("OMI_APP_ID")
 OMI_APP_SECRET = os.environ.get("OMI_APP_SECRET")
 
 # Auto-finalization knobs
-IDLE_TIMEOUT_SEC = int(os.environ.get("IDLE_TIMEOUT_SEC", "180"))   # wall-clock idle -> finalize on next batch
-MAX_SEG_GAP_SEC = float(os.environ.get("MAX_SEG_GAP_SEC", "120"))   # audio timeline gap -> finalize on next batch
+IDLE_TIMEOUT_SEC = int(os.environ.get("IDLE_TIMEOUT_SEC", "180"))    # wall-clock idle -> finalize on next batch
+MAX_SEG_GAP_SEC = float(os.environ.get("MAX_SEG_GAP_SEC", "120"))    # audio timeline gap -> finalize on next batch
 
 PID = os.getpid()
 
@@ -61,27 +62,51 @@ class RTIncomingSegment(BaseModel):
 
 class RTTranscriptBatch(BaseModel):
     segments: List[RTIncomingSegment]
-    session_id: Optional[str] = None   # treated as uid fallback
-    uid: Optional[str] = None          # accepted too
-
-app = FastAPI(title="Rizz Meter Server")
+    session_id: Optional[str] = None    # treated as uid fallback
+    uid: Optional[str] = None           # accepted too
 
 # =========================
-# Optional NLP
+# Optional NLP (Loaded in Lifespan)
 # =========================
 HF_PIPELINE = None
 VADER = None
-try:
-    from transformers import pipeline
-    HF_PIPELINE = pipeline("sentiment-analysis")
-except Exception:
-    HF_PIPELINE = None
 
-try:
-    from nltk.sentiment import SentimentIntensityAnalyzer
-    VADER = SentimentIntensityAnalyzer()
-except Exception:
+# =========================
+# FIX 1: Lifespan Manager
+# =========================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # This code runs ON STARTUP
+    global HF_PIPELINE, VADER
+    print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🚀 Server starting up, loading models...")
+    
+    try:
+        from transformers import pipeline
+        HF_PIPELINE = pipeline("sentiment-analysis")
+        print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ✅ HF Pipeline loaded.")
+    except Exception as e:
+        print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ❌ ERROR: Failed to load HF_PIPELINE: {e}")
+        HF_PIPELINE = None
+
+    try:
+        from nltk.sentiment import SentimentIntensityAnalyzer
+        VADER = SentimentIntensityAnalyzer()
+        print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ✅ VADER loaded.")
+    except Exception as e:
+        print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ❌ ERROR: Failed to load VADER: {e}")
+        VADER = None
+    
+    yield
+    
+    # This code runs ON SHUTDOWN
+    print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 👋 Server shutting down, clearing models...")
+    HF_PIPELINE = None
     VADER = None
+
+# =========================
+# App Initialization
+# =========================
+app = FastAPI(title="Rizz Meter Server", lifespan=lifespan) # <-- FIX 1: PASS LIFESPAN
 
 # =========================
 # Heuristics/utilities
@@ -226,7 +251,7 @@ def analyze_sentiment(segments: List[TranscriptSegment]) -> Dict:
             s = 0.5
         per_seg_scores.append((seg.start, s))
         pos_tokens += sum(1 for p in APPRECIATION_PATTERNS if re.search(p, txt.lower()))
-        if contains_any(txt, LAUGHTER_PATTERNS):
+        if contains_any(txt, LAUGHTTER_PATTERNS):
             laughs += 1
     if not per_seg_scores:
         return {"score": 50}
@@ -452,76 +477,90 @@ async def _get_state(uid: str) -> ConvState:
             CONVS[uid] = ConvState()
         return CONVS[uid]
 
+# =========================
+# FIX 2: Deadlock Fix
+# =========================
+
 async def _finalize_and_analyze(uid: str) -> Dict:
+    """
+    Lock-acquiring wrapper for external calls (e.g., /conversation/end endpoint).
+    """
     state = await _get_state(uid)
     async with state.lock:
-        segs = list(state.buffer)
-        print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🔔 Finalizing uid={uid} with {len(segs)} segments")
+        return _finalize_and_analyze_UNLOCKED(state, uid)
 
-        def non_marker_texts():
-            for s in segs:
-                if not _is_start_marker(s.text) and not _is_end_marker(s.text):
-                    t = s.text.strip()
-                    if t:
-                        yield t
-        title = state.title or next((t[:60] for t in non_marker_texts()), "Conversation")
-        clean_segments = [s for s in segs if not _is_start_marker(s.text) and not _is_end_marker(s.text)]
+def _finalize_and_analyze_UNLOCKED(state: ConvState, uid: str) -> Dict:
+    """
+    Analyzes the buffer, sends push, and resets state.
+    Assumes state.lock is ALREADY HELD.
+    """
+    segs = list(state.buffer)
+    print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🔔 Finalizing uid={uid} with {len(segs)} segments")
 
-        if len(clean_segments) < 2:
-            print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ⚠️ Not enough segments to analyze (uid={uid}).")
-            summary = {"status": "error", "message": "Not enough segments to analyze."}
+    def non_marker_texts():
+        for s in segs:
+            if not _is_start_marker(s.text) and not _is_end_marker(s.text):
+                t = s.text.strip()
+                if t:
+                    yield t
+    title = state.title or next((t[:60] for t in non_marker_texts()), "Conversation")
+    clean_segments = [s for s in segs if not _is_start_marker(s.text) and not _is_end_marker(s.text)]
+
+    if len(clean_segments) < 2:
+        print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ⚠️ Not enough segments to analyze (uid={uid}).")
+        summary = {"status": "error", "message": "Not enough segments to analyze."}
+    else:
+        # analytics
+        reciprocity = analyze_reciprocity(clean_segments)
+        interruptions = analyze_interruptions(clean_segments)
+        backchannels = analyze_backchannels(clean_segments)
+        attentiveness = analyze_attentiveness(clean_segments)
+        followups = analyze_followups(clean_segments)
+        warmth = analyze_sentiment(clean_segments)
+        comfort = analyze_comfort(clean_segments)
+        boundary = analyze_boundary_respect(clean_segments)
+        chemistry = analyze_chemistry(clean_segments)
+        metrics = {
+            "Reciprocity": reciprocity, "Interruptions": interruptions, "Backchannels": backchannels,
+            "Attentiveness": attentiveness, "FollowUps": followups, "Warmth": warmth,
+            "Comfort": comfort, "Boundary": boundary, "Chemistry": chemistry
+        }
+        final_score = compute_final_score(metrics)
+        strengths, tips = summarize_strengths_and_tips(metrics)
+        body = compose_notification(title, final_score, metrics, strengths, tips)
+        push_uid = state.last_uid or uid
+        if push_uid:
+            print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 📣 Pushing to uid='{push_uid}', score={final_score}")
+            send_notification(push_uid, title="Your Rizz Report is Ready", body=body)
         else:
-            # analytics
-            reciprocity = analyze_reciprocity(clean_segments)
-            interruptions = analyze_interruptions(clean_segments)
-            backchannels = analyze_backchannels(clean_segments)
-            attentiveness = analyze_attentiveness(clean_segments)
-            followups = analyze_followups(clean_segments)
-            warmth = analyze_sentiment(clean_segments)
-            comfort = analyze_comfort(clean_segments)
-            boundary = analyze_boundary_respect(clean_segments)
-            chemistry = analyze_chemistry(clean_segments)
-            metrics = {
-                "Reciprocity": reciprocity, "Interruptions": interruptions, "Backchannels": backchannels,
-                "Attentiveness": attentiveness, "FollowUps": followups, "Warmth": warmth,
-                "Comfort": comfort, "Boundary": boundary, "Chemistry": chemistry
-            }
-            final_score = compute_final_score(metrics)
-            strengths, tips = summarize_strengths_and_tips(metrics)
-            body = compose_notification(title, final_score, metrics, strengths, tips)
-            push_uid = state.last_uid or uid
-            if push_uid:
-                print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 📣 Pushing to uid='{push_uid}', score={final_score}")
-                send_notification(push_uid, title="Your Rizz Report is Ready", body=body)
-            else:
-                print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🔕 No uid to push")
+            print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🔕 No uid to push")
 
-            summary = {
-                "status": "success",
-                "summary": {
-                    "title": title,
-                    "final_score": final_score,
-                    "subscores": {
-                        "reciprocity": reciprocity, "attentiveness": attentiveness, "warmth": warmth,
-                        "comfort": comfort, "boundary": boundary, "chemistry": chemistry
-                    },
-                    "supporting_signals": {
-                        "interruptions": interruptions, "backchannels": backchannels, "followups": followups
-                    },
-                    "highlights": strengths,
-                    "improvements": tips,
-                    "generated_at": datetime.now(timezone.utc).isoformat()
-                }
+        summary = {
+            "status": "success",
+            "summary": {
+                "title": title,
+                "final_score": final_score,
+                "subscores": {
+                    "reciprocity": reciprocity, "attentiveness": attentiveness, "warmth": warmth,
+                    "comfort": comfort, "boundary": boundary, "chemistry": chemistry
+                },
+                "supporting_signals": {
+                    "interruptions": interruptions, "backchannels": backchannels, "followups": followups
+                },
+                "highlights": strengths,
+                "improvements": tips,
+                "generated_at": datetime.now(timezone.utc).isoformat()
             }
+        }
 
-        # reset state
-        state.active = False
-        state.buffer = []
-        state.title = None
-        state.last_uid = None
-        state.touch_wall()
-        state.last_seg_end = 0.0
-        return summary
+    # reset state
+    state.active = False
+    state.buffer = []
+    state.title = None
+    state.last_uid = None
+    state.touch_wall()
+    state.last_seg_end = 0.0
+    return summary
 
 # =========================
 # Endpoints
@@ -570,17 +609,20 @@ async def transcript_processed(
         # Soft auto-finalize if previously active and idle too long (handled on arrival of any new batch)
         if state.active and state.last_wall_ts and (now_ts - state.last_wall_ts > IDLE_TIMEOUT_SEC) and state.buffer:
             print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ⏰ Idle timeout (wall) for uid={effective_uid}. Auto-finalizing previous convo.")
-            await _finalize_and_analyze(effective_uid)
+            # FIX 2: Call UNLOCKED version
+            _finalize_and_analyze_UNLOCKED(state, effective_uid)
 
         # Manual overrides
         if force_end:
             print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🛑 force_end received for uid={effective_uid}")
-            return await _finalize_and_analyze(effective_uid)
+            # FIX 2: Call UNLOCKED version
+            return _finalize_and_analyze_UNLOCKED(state, effective_uid)
 
         if has_start or force_start:
             if state.active and state.buffer:
                 print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🔄 start while active (uid={effective_uid}) — auto-finalizing previous.")
-                await _finalize_and_analyze(effective_uid)
+                # FIX 2: Call UNLOCKED version
+                _finalize_and_analyze_UNLOCKED(state, effective_uid)
             state.active = True
             state.buffer = []
             state.title = None
@@ -611,11 +653,13 @@ async def transcript_processed(
 
         if has_end:
             print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🟥 end marker detected — finalizing (uid={effective_uid})")
-            return await _finalize_and_analyze(effective_uid)
+            # FIX 2: Call UNLOCKED version
+            return _finalize_and_analyze_UNLOCKED(state, effective_uid)
 
         if audio_gap_trigger and state.buffer:
             print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ⏰ Large audio gap detected (> {MAX_SEG_GAP_SEC}s). Auto-finalizing (uid={effective_uid}).")
-            return await _finalize_and_analyze(effective_uid)
+            # FIX 2: Call UNLOCKED version
+            return _finalize_and_analyze_UNLOCKED(state, effective_uid)
 
         print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🔄 Buffering: total segments={len(state.buffer)} (uid={effective_uid})")
         return {"status": "buffering", "segments_buffered": len(state.buffer), "will_push_on_end": True, "pid": PID}
@@ -624,6 +668,7 @@ async def transcript_processed(
 @app.post("/conversation/end")
 async def conversation_end(uid: str = Query(...)):
     print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🛑 /conversation/end called for uid={uid}")
+    # This correctly calls the LOCKING wrapper
     return await _finalize_and_analyze(uid)
 
 # Back-compat endpoint (memory_created)
