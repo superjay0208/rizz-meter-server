@@ -36,9 +36,9 @@ class Memory(BaseModel):
 class RTIncomingSegment(BaseModel):
     id: Optional[str] = None
     text: str
-    speaker: Optional[str] = None          # e.g., "SPEAKER_0"
-    speaker_id: Optional[int] = None       # e.g., 0, 1
-    is_user: Optional[bool] = None         # whether this is the local user
+    speaker: Optional[str] = None
+    speaker_id: Optional[int] = None
+    is_user: Optional[bool] = None
     person_id: Optional[str] = None
     start: float
     end: float
@@ -47,13 +47,18 @@ class RTIncomingSegment(BaseModel):
 
 class RTTranscriptBatch(BaseModel):
     segments: List[RTIncomingSegment]
-    session_id: str
-    uid: Optional[str] = None              # allow uid to come with batch (recommended)
+    session_id: Optional[str] = None   # ignored by logic; kept for compatibility
+    uid: Optional[str] = None          # include if you want a push
 
 # ---------------------------
 # App
 # ---------------------------
 app = FastAPI(title="Rizz Meter Server")
+
+# Simple health check so you don't get 404s on GET /
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "Rizz Meter Server"}
 
 # ---------------------------
 # Optional NLP backends
@@ -81,9 +86,9 @@ LAUGHTER_PATTERNS = [r"\b(lol|haha|lmao|rofl|\[laughs\]|(ha){2,})\b"]
 BACKCHANNELS = {"yeah","uh-huh","mm-hmm","right","gotcha","i see","ok","okay","mhmm","yup"}
 BOUNDARY_PHRASES = [r"\b(not comfortable|don’t want to talk|rather not|can we change the topic|let’s change the topic|no, thanks)\b"]
 
-# Markers (case-insensitive; end supports common typo)
-START_MARKERS = ["conversation starts"]
-END_MARKERS = ["conversation ends", "conversaition ends"]
+# Case-insensitive, whitespace/punctuation tolerant markers
+START_RE = re.compile(r"\bconversation\s*starts\b", re.I)
+END_RE   = re.compile(r"\bconversa(?:i?t)ion\s*ends\b", re.I)  # matches "conversation ends" and "conversaition ends"
 
 def clamp01(x: float) -> float:
     return max(0.0, min(1.0, x))
@@ -97,10 +102,6 @@ def words(text: str) -> List[str]:
 def contains_any(text: str, patterns: List[str]) -> bool:
     tl = text.lower()
     return any(re.search(p, tl) for p in patterns)
-
-def count_matches(text: str, patterns: List[str]) -> int:
-    tl = text.lower()
-    return sum(1 for p in patterns if re.search(p, tl))
 
 def avg(lst: List[float]) -> float:
     return sum(lst)/len(lst) if lst else 0.0
@@ -157,10 +158,7 @@ def analyze_attentiveness(segments: List[TranscriptSegment]) -> Dict:
         if seg.text.strip().endswith("?"):
             questions[seg.speaker] = questions.get(seg.speaker, 0) + 1
     total_questions = sum(questions.values())
-    if segments:
-        total_time = segments[-1].end - segments[0].start
-    else:
-        total_time = 0.0
+    total_time = (segments[-1].end - segments[0].start) if segments else 0.0
     target_rate = 1.0 / 30.0
     actual_rate = 0.0 if total_time <= 0 else total_questions / total_time
     score = clamp01(actual_rate / target_rate)
@@ -335,12 +333,6 @@ def summarize_strengths_and_tips(metrics: Dict[str, Dict]) -> Tuple[List[str], L
         if k == "Comfort": tips.append("Let a ~1s beat after jokes or new topics—don’t rush.")
         if k == "Boundary": tips.append("If they pass on a topic, pivot and check-in before moving on.")
         if k == "Chemistry": tips.append("Answer questions directly, then volley a question back.")
-    if "Interruptions" in metrics and metrics["Interruptions"]["score"] < 80:
-        tips.append("Avoid cutting in—if excited, use a short back-channel and wait.")
-    if "Backchannels" in metrics and metrics["Backchannels"]["score"] < 60:
-        tips.append("Sprinkle supportive nods (“mm-hmm”, “I see”) while they talk.")
-    if "FollowUps" in metrics and metrics["FollowUps"]["score"] < 60:
-        tips.append("Reference their words: “Earlier you mentioned __—tell me more?”")
     return strengths[:2], tips[:2]
 
 def compute_final_score(metrics: Dict[str, Dict]) -> int:
@@ -388,37 +380,28 @@ def compose_notification(memory_title: str, final: int, metrics: Dict[str, Dict]
     breakdown = f"R {br['R']} · A {br['A']} · W {br['W']} · C {br['C']} · B {br['B']} · Ch {br['Ch']}"
     hi = " • ".join(strengths) if strengths else "Nice effort!"
     im = " • ".join(tips) if tips else "Keep doing what felt natural."
-
     title_snippet = truncate(memory_title, 60)
-
     body_multiline = (
         f"Date Rizz: {final}/100 — “{title_snippet}”\n"
         f"{breakdown}\n"
         f"✅ Highlights: {hi}\n"
         f"💡 Try: {im}"
     )
-
     if len(body_multiline) > 500:
-        body_compact = (
-            f"Date Rizz {final}/100 — “{title_snippet}”. "
-            f"{breakdown}. "
-            f"Highlights: {hi}. "
-            f"Try: {im}"
-        )
-        return body_compact
-
+        return (f"Date Rizz {final}/100 — “{title_snippet}”. {breakdown}. "
+                f"Highlights: {hi}. Try: {im}")
     return body_multiline
 
 # ---------------------------
-# Real-time session state
+# Real-time single-conversation state (session_id IGNORED)
 # ---------------------------
-SESSION_BUFFERS: Dict[str, List[TranscriptSegment]] = {}
-SESSION_STARTED: Dict[str, bool] = {}
-SESSION_TITLES: Dict[str, str] = {}  # optional: set a human-readable title
+ACTIVE: bool = False
+BUFFER: List[TranscriptSegment] = []
+TITLE: Optional[str] = None
+LAST_UID: Optional[str] = None
 STATE_LOCK = asyncio.Lock()
 
 def _normalize_speaker(seg: RTIncomingSegment) -> str:
-    # Prefer is_user -> "You" vs "Partner"; else fall back to speaker/speaker_id.
     if seg.is_user is True:
         return "You"
     if seg.is_user is False:
@@ -438,29 +421,30 @@ def _rt_to_internal(seg: RTIncomingSegment) -> TranscriptSegment:
     )
 
 def _is_start_marker(txt: str) -> bool:
-    tl = txt.lower()
-    return any(m in tl for m in START_MARKERS)
+    return bool(START_RE.search(txt or ""))
 
 def _is_end_marker(txt: str) -> bool:
-    tl = txt.lower()
-    return any(m in tl for m in END_MARKERS)
+    return bool(END_RE.search(txt or ""))
 
-async def _finalize_and_analyze(session_id: str, uid: Optional[str]) -> Dict:
-    segments = SESSION_BUFFERS.get(session_id, [])
-    print(f"[{datetime.utcnow().isoformat()}Z] 🔚 End marker received. Session '{session_id}' collected {len(segments)} segments. Running analysis...")
+async def _finalize_and_analyze(uid: Optional[str]) -> Dict:
+    global ACTIVE, BUFFER, TITLE, LAST_UID
+    segments = BUFFER[:]
+    print(f"[{datetime.utcnow().isoformat()}Z] 🔚 End marker received. Collected {len(segments)} segments. Running analysis...")
 
-    # Derive a lightweight title: first real utterance (non-marker), else session id
-    title = SESSION_TITLES.get(session_id) or next(
-        (s.text[:40] for s in segments if (not _is_start_marker(s.text) and not _is_end_marker(s.text) and s.text.strip())),
-        f"Session {session_id}"
-    )
+    # Title: first non-marker content or default
+    def non_marker_texts():
+        for s in segments:
+            if not _is_start_marker(s.text) and not _is_end_marker(s.text):
+                t = s.text.strip()
+                if t:
+                    yield t
+    title = TITLE or next((t[:60] for t in non_marker_texts()), "Conversation")
 
-    # Filter out any explicit marker lines from analysis
     clean_segments = [s for s in segments if not _is_start_marker(s.text) and not _is_end_marker(s.text)]
 
     if len(clean_segments) < 2:
-        summary = {"status": "error", "message": "Not enough segments to analyze.", "session_id": session_id}
-        print(f"[{datetime.utcnow().isoformat()}Z] ⚠️ Analysis skipped for '{session_id}': not enough segments.")
+        print(f"[{datetime.utcnow().isoformat()}Z] ⚠️ Analysis skipped: not enough segments.")
+        summary = {"status": "error", "message": "Not enough segments to analyze."}
     else:
         reciprocity = analyze_reciprocity(clean_segments)
         interruptions = analyze_interruptions(clean_segments)
@@ -486,14 +470,15 @@ async def _finalize_and_analyze(session_id: str, uid: Optional[str]) -> Dict:
         strengths, tips = summarize_strengths_and_tips(metrics)
         report_title = "Your Rizz Report is Ready"
         report_body = compose_notification(title, final_score, metrics, strengths, tips)
-        if uid:
-            print(f"[{datetime.utcnow().isoformat()}Z] 📣 Sending push to uid='{uid}' for session '{session_id}' with score {final_score}.")
-            send_notification(uid, title=report_title, body=report_body)
-        print(f"[{datetime.utcnow().isoformat()}Z] ✅ Analysis complete for '{session_id}'. Final score: {final_score}")
+
+        real_uid = uid or LAST_UID
+        if real_uid:
+            print(f"[{datetime.utcnow().isoformat()}Z] 📣 Sending push to uid='{real_uid}' with score {final_score}.")
+            send_notification(real_uid, title=report_title, body=report_body)
+        print(f"[{datetime.utcnow().isoformat()}Z] ✅ Analysis complete. Final score: {final_score}")
 
         summary = {
             "status": "success",
-            "session_id": session_id,
             "summary": {
                 "title": title,
                 "final_score": final_score,
@@ -516,72 +501,60 @@ async def _finalize_and_analyze(session_id: str, uid: Optional[str]) -> Dict:
             }
         }
 
-    # Cleanup session state
-    SESSION_BUFFERS.pop(session_id, None)
-    SESSION_STARTED.pop(session_id, None)
-    SESSION_TITLES.pop(session_id, None)
+    # Reset state
+    ACTIVE = False
+    BUFFER = []
+    TITLE = None
+    LAST_UID = None
     return summary
 
 # ---------------------------
-# New: real-time endpoint
+# Real-time endpoint (use this)
 # ---------------------------
 @app.post("/transcript_processed")
 async def transcript_processed(batch: RTTranscriptBatch):
     """
-    Real-time streaming handler.
-    - Call with {segments:[...], session_id, uid?}
-    - Start when any segment text contains "conversation starts"
-    - End when any segment text contains "conversation ends" or "conversaition ends"
-    - Buffers per session_id. On end, runs analysis and (optionally) sends a push.
+    Real-time handler. session_id is ignored.
+    Start when text contains "conversation starts" (any case).
+    End when text contains "conversation ends" or "conversaition ends" (any case).
     """
-    sid = batch.session_id
-    uid = batch.uid
-
+    global ACTIVE, BUFFER, TITLE, LAST_UID
     if not batch.segments:
-        return {"status": "ignored", "reason": "no_segments", "session_id": sid}
+        return {"status": "ignored", "reason": "no_segments"}
 
     async with STATE_LOCK:
-        buf = SESSION_BUFFERS.get(sid, [])
-        started = SESSION_STARTED.get(sid, False)
+        # Detect markers in this batch
+        has_start = any(_is_start_marker(s.text) for s in batch.segments)
+        has_end   = any(_is_end_marker(s.text) for s in batch.segments)
 
-        # Pass 1: detect markers in this batch
-        batch_has_start = any(_is_start_marker(s.text or "") for s in batch.segments)
-        batch_has_end = any(_is_end_marker(s.text or "") for s in batch.segments)
+        # Start: reset buffer/title and mark active
+        if has_start:
+            ACTIVE = True
+            BUFFER = []
+            TITLE = None
+            print(f"[{datetime.utcnow().isoformat()}Z] 🟢 Start marker received. Conversation initialized.")
 
-        # If we see "conversation starts", (re)initialize the buffer
-        if batch_has_start:
-            SESSION_BUFFERS[sid] = []
-            SESSION_STARTED[sid] = True
-            SESSION_TITLES[sid] = None  # reset per conversation
-            buf = SESSION_BUFFERS[sid]
-            print(f"[{datetime.utcnow().isoformat()}Z] 🟢 Start marker received. Session '{sid}' initialized.")
+        # If not active yet, ignore until we see a start
+        if not ACTIVE:
+            print(f"[{datetime.utcnow().isoformat()}Z] ⏸️ Batch ignored: conversation not started yet.")
+            return {"status": "ignored", "reason": "not_started"}
 
-        # If conversation hasn't been started yet, ignore until it is
-        if not SESSION_STARTED.get(sid, False):
-            print(f"[{datetime.utcnow().isoformat()}Z] ⏸️ Ignoring batch for '{sid}': conversation not started yet.")
-            return {"status": "ignored", "reason": "not_started", "session_id": sid}
+        # Remember uid if provided
+        if batch.uid:
+            LAST_UID = batch.uid
 
-        # Append normalized segments
+        # Append normalized segments; pick a title from the first non-marker text
         for seg in batch.segments:
             internal = _rt_to_internal(seg)
-            # On first non-marker text, set a default title for notification/report
-            if SESSION_TITLES.get(sid) is None and internal.text.strip() and not _is_start_marker(internal.text) and not _is_end_marker(internal.text):
-                SESSION_TITLES[sid] = internal.text.strip()[:60]
-            buf.append(internal)
+            if TITLE is None and internal.text.strip() and not _is_start_marker(internal.text) and not _is_end_marker(internal.text):
+                TITLE = internal.text.strip()[:60]
+            BUFFER.append(internal)
 
-        # End?
-        if batch_has_end:
-            return await _finalize_and_analyze(sid, uid)
+        if has_end:
+            return await _finalize_and_analyze(uid=batch.uid)
 
-        # Otherwise keep accumulating
-        SESSION_BUFFERS[sid] = buf
-        print(f"[{datetime.utcnow().isoformat()}Z] 🔄 Buffering for '{sid}': total segments={len(buf)}")
-        return {
-            "status": "buffering",
-            "session_id": sid,
-            "segments_buffered": len(buf),
-            "started": True
-        }
+        print(f"[{datetime.utcnow().isoformat()}Z] 🔄 Buffering: total segments={len(BUFFER)}")
+        return {"status": "buffering", "segments_buffered": len(BUFFER)}
 
 # ---------------------------
 # Back-compat endpoint (unchanged)
