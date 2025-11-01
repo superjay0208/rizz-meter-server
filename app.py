@@ -251,7 +251,7 @@ def analyze_sentiment(segments: List[TranscriptSegment]) -> Dict:
             s = 0.5
         per_seg_scores.append((seg.start, s))
         pos_tokens += sum(1 for p in APPRECIATION_PATTERNS if re.search(p, txt.lower()))
-        if contains_any(txt, LAUGHTTER_PATTERNS):
+        if contains_any(txt, LAUGHTER_PATTERNS):
             laughs += 1
     if not per_seg_scores:
         return {"score": 50}
@@ -702,3 +702,4 @@ if __name__ == "__main__":
     print(f"Starting Rizz Meter server on http://0.0.0.0:{port} (pid={PID})")
     # Keep single worker in prod to avoid split memory problems, or persist state to Redis/DB if you need >1.
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
