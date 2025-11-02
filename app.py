@@ -29,7 +29,7 @@ MAX_SEG_GAP_SEC = float(os.environ.get("MAX_SEG_GAP_SEC", "120"))
 PID = os.getpid()
 
 # Silence/Nudge knobs
-SILENCE_HINT_SEC   = int(os.environ.get("SILENCE_HINT_SEC", "20"))     # when to nudge
+SILENCE_HINT_SEC   = int(os.environ.get("SILENCE_HINT_SEC", "5"))     # when to nudge
 BUZZ_COOLDOWN_SEC  = int(os.environ.get("BUZZ_COOLDOWN_SEC", "120"))   # avoid spam
 NUDGE_MAX_CHARS    = int(os.environ.get("NUDGE_MAX_CHARS", "160"))     # short push text
 
@@ -710,3 +710,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     print(f"Starting Rizz Meter server on http://0.0.0.0:{port} (pid={PID})")
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
