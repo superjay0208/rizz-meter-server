@@ -180,9 +180,11 @@ Breakdown:
 
 # --- NUDGE & PROFILE PROMPTS ---
 DEEPSEEK_NUDGE_SYSTEM_PROMPT = """You are a concise conversation coach.
-Given a partial date transcript, respond with ONE line (<= {max_chars} chars) suggesting 2–3 adjacent topics.
-Format: Try: topic1 • topic2 • topic3
-Keep it specific to their chat so far. No extra text."""
+ALWAYS produce exactly ONE line (<= {max_chars} chars) that begins with 'Try:' and suggests 2–3 adjacent topics.
+• Do this REGARDLESS of transcript length or who is speaking.
+• Prioritize the other person (not the user): frame topics as questions or prompts about THEM.
+• If the partner's details are unknown, assume a neutral 'your date' persona.
+• Use ' • ' to separate topics. No extra sentences, no emojis, no newlines."""
 DEEPSEEK_PROFILE_SYSTEM_PROMPT = """Extract a partner profile from a date transcript.
 Return ONLY minified JSON with these keys:
 {
@@ -493,18 +495,58 @@ def _compact_transcript_text(segments: List[TranscriptSegment], max_chars: int =
     return out[-max_chars:]
 
 async def generate_topic_nudges(segments: List[TranscriptSegment], title_hint: Optional[str]) -> Optional[str]:
-    if not DEEPSEEK_API_KEY or not segments:
-        return None
-    body = _compact_transcript_text(segments, 1200)
-    sys = DEEPSEEK_NUDGE_SYSTEM_PROMPT.format(max_chars=NUDGE_MAX_CHARS)
+    # Build a compact body (OK even if it's only user lines or very short)
+    body = _compact_transcript_text(segments or [], 1200)
+
+    # Try to find a non-user speaker to personalize; otherwise use a neutral label
+    target = next(
+        (s.speaker for s in reversed(segments or [])
+         if (s.speaker or "").lower() != "you" and (s.text or "").strip()),
+        "your date"
+    )
+
+    sys = DEEPSEEK_NUDGE_SYSTEM_PROMPT.replace("{max_chars}", str(NUDGE_MAX_CHARS))
+    user_content = (
+        f"Direct your suggestions toward {target}. "
+        f"If context is thin, infer plausible adjacent topics from general small-talk heuristics.\n\n"
+        f"Title hint: {title_hint or 'Date'}\n\nTranscript:\n{body}"
+    )
+
     messages = [
         {"role": "system", "content": sys},
-        {"role": "user", "content": f"Title hint: {title_hint or 'Date'}\n\nTranscript:\n{body}"}
+        {"role": "user", "content": user_content}
     ]
-    text = await call_deepseek(messages, temperature=0.6, max_tokens=256)
+
+    # Use deepseek-chat (not reasoner) + stop at newline to force a single line
+    text = await call_deepseek(
+        messages,
+        temperature=0.6,
+        max_tokens=64,
+        model=DEEPSEEK_NUDGE_MODEL,   # 'deepseek-chat' by default
+        stop=["\n"]
+    )
+
+    # Fallbacks to guarantee an output even if API returns empty content
     if not text:
-        return None
-    line = text.strip().replace("\n", " ")
+        fallback_sys = (
+            f"ALWAYS respond with exactly one line starting with 'Try:' and <= {NUDGE_MAX_CHARS} chars. "
+            "If details are unknown, prefer neutral but specific, partner-centered prompts."
+        )
+        text = await call_deepseek(
+            [{"role": "system", "content": fallback_sys}, {"role": "user", "content": user_content}],
+            temperature=0.5,
+            max_tokens=64,
+            model="deepseek-chat",
+            stop=["\n"]
+        )
+
+    if not text:
+        # Absolute last resort: deterministic, partner-focused default
+        return "Try: their weekend plans • favorite cuisines • a recent show they liked"
+
+    line = text.strip().splitlines()[0]
+    if not line.lower().startswith("try:"):
+        line = "Try: " + line
     return line[:NUDGE_MAX_CHARS]
 
 async def extract_partner_profile(segments: List[TranscriptSegment]) -> Optional[dict]:
@@ -736,3 +778,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     print(f"Starting Rizz Meter server on http://0.0.0.0:{port} (pid={PID})")
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
