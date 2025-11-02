@@ -293,58 +293,82 @@ async def send_notification(uid: str, title: str, body: str):
     except Exception as e:
         print(f"Error sending notification: {e}")
 
+async def create_conversation(uid: str, text: str):
+    api_key = os.environ.get("OMI_API_KEY")
+    if not OMI_APP_ID or not api_key or not http_client:
+        return
+
+    url = f"https://api.omi.me/v2/integrations/{OMI_APP_ID}/user/conversations"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    params = {"uid": uid}
+    payload = {
+        "text": text,
+        "text_source": "other_text",
+        "text_source_spec": "rizz_meter_report",
+        "language": "en"
+        # optionally: started_at / finished_at in ISO 8601
+    }
+    resp = await http_client.post(url, headers=headers, params=params, json=payload, timeout=30.0)
+    if 200 <= resp.status_code < 300:
+        print("✅ Conversation created.")
+    else:
+        print(f"❌ Failed to create conversation. {resp.status_code} {resp.text}")
+
+
+
 async def save_text_as_memory(uid: str, text_content: str):
     """
-    Saves the raw, formatted LLM report as a new memory in Omi.
-    This version uses PUT and a real JSON body, as implied by the 405 error.
+    Save the LLM report as a single explicit memory in Omi.
+    Uses the Import API (Create Memories) per docs.
     """
     print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) Attempting to save memory for uid={uid}")
-    if not OMI_APP_ID or not OMI_APP_SECRET:
-        print("❌ CRITICAL ERROR: OMI_APP_ID or OMI_APP_SECRET is not set. Cannot save memory.")
+
+    api_key = os.environ.get("OMI_APP_SECRET")
+    if not OMI_APP_ID or not api_key:
+        print("❌ CRITICAL ERROR: OMI_APP_ID or OMI_API_KEY is not set. Cannot save memory.")
         return
     if not http_client:
         print("❌ HTTP Client not initialized; skipping memory save.")
         return
 
-    # The URL from the last fix was correct.
-    url = f"https://api.omi.me/v2/integrations/{OMI_APP_ID}/memories"
-
-    # --- START FIX ---
-
-    # 1. Use standard headers for a JSON payload.
-    #    (We remove 'Content-Length: 0')
+    url = f"https://api.omi.me/v2/integrations/{OMI_APP_ID}/user/memories"
     headers = {
-        "Authorization": f"Bearer {OMI_APP_SECRET}",
-        "Content-Type": "application/json"
+        "Authorization": f"Bearer {api_key}",  # <-- API KEY (sk_...), per docs
+        "Content-Type": "application/json",
     }
-    
-    # 2. Pass 'uid' as a query parameter (common for integrations)
     params = {"uid": uid}
-    
-    # 3. Pass the 'text' and 'app_id' in the JSON BODY.
-    #    This is standard for PUT/POST, and different from the notification call.
+
+    # Option A: store the whole report as ONE explicit memory (recommended for your use case)
     payload = {
-        "text": text_content,
-        "app_id": OMI_APP_ID
+        "memories": [
+            {
+                "content": text_content,
+                "tags": ["rizz_report", "dating", "post-date"]
+            }
+        ],
+        "text_source": "other",
+        "text_source_spec": "rizz_meter"
     }
+
+    # Option B (alternative): let Omi extract memories from free text instead
+    # payload = {
+    #     "text": text_content,
+    #     "text_source": "other",
+    #     "text_source_spec": "rizz_meter"
+    # }
 
     try:
-        # 4. Use the PUT verb, not POST.
-        #    We send 'params' for the URL and 'json' for the body.
-        resp = await http_client.put(
-            url, 
-            headers=headers, 
-            params=params, 
-            json=payload,  # <-- Send a real JSON body
-            timeout=15.0
+        resp = await http_client.post(
+            url,
+            headers=headers,
+            params=params,
+            json=payload,
+            timeout=30.0
         )
-        
-    # --- END FIX ---
-        
         if 200 <= resp.status_code < 300:
-            print(f"✅ Memory saved successfully. ID: {resp.json().get('id')}")
+            print("✅ Memory created (Import API).")
         else:
-            print(f"❌ Failed to save memory. Status: {resp.status_code}")
+            print(f"❌ Failed to create memory. Status: {resp.status_code}")
             print(f"Response body: {resp.text}")
     except Exception as e:
         print(f"Error saving memory: {e}")
@@ -449,7 +473,10 @@ async def _finalize_and_analyze_UNLOCKED(state: ConvState, uid: str) -> Dict:
                 # Send notification (title + body)
                 await send_notification(push_uid, title=report_title, body=report_body)
                 # Save memory (just the body)
-                await save_text_as_memory(push_uid, report_body) 
+                await create_conversation(push_uid, report_body)
+                await save_text_as_memory(push_uid, report_body)
+
+                
 
             summary = {
                 "status": "success",
@@ -565,5 +592,6 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     print(f"Starting Rizz Meter server on http://0.0.0.0:{port} (pid={PID})")
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
 
 
