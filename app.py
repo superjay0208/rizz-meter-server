@@ -67,8 +67,6 @@ class RTTranscriptBatch(BaseModel):
 # =========================
 # App lifespan (HTTP Client)
 # =========================
-
-# Global HTTP client
 http_client: Optional[httpx.AsyncClient] = None
 
 @asynccontextmanager
@@ -204,7 +202,6 @@ Return ONLY minified JSON with these keys:
 If unknown, use null or []. No commentary. Only JSON."""
 
 def deepseek_user_prompt(transcript_json: List[Dict[str, Any]], title_hint: Optional[str]) -> str:
-    """Creates the simple user-prompt string with the transcript."""
     transcript_str = json.dumps(transcript_json, indent=2)
     return f"Title hint (you can ignore if you find a better one): {title_hint}\n\nTranscript:\n{transcript_str}"
 
@@ -262,7 +259,6 @@ async def call_deepseek(messages, temperature=0.2, max_tokens=2048, *, model: Op
 
     print("❌ DeepSeek: retries exhausted.")
     return None
-
 
 @app.get("/deepseek/ping")
 async def deepseek_ping():
@@ -332,76 +328,20 @@ async def send_notification(uid: str, title: str, body: str):
     except Exception as e:
         print(f"Error sending notification: {e}")
 
-# Imports: save LLM report as conversation + explicit memory
-async def save_text_as_memory(uid: str, text_content: str):
-    print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) Attempting to save memory for uid={uid}")
-
-    api_key = _get_imports_token()
-    if not OMI_APP_ID or not api_key or not http_client:
-        print("❌ Missing OMI_APP_ID or Imports token or HTTP client.")
-        return
-
-    # (A) Create a conversation holding the full report text
-    try:
-        conv_url = f"https://api.omi.me/v2/integrations/{OMI_APP_ID}/user/conversations"
-        conv_headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        conv_params = {"uid": uid}
-        conv_payload = {
-            "text": text_content,
-            "text_source": "other_text",
-            "text_source_spec": "rizz_meter_report",
-            "language": "en",
-        }
-        conv_resp = await http_client.post(conv_url, headers=conv_headers, params=conv_params,
-                                           json=conv_payload, timeout=30.0)
-        if 200 <= conv_resp.status_code < 300:
-            print("✅ Conversation created (Imports).")
-        else:
-            print(f"❌ Create conversation failed. {conv_resp.status_code} {conv_resp.text}")
-    except Exception as e:
-        print(f"Error creating conversation: {e}")
-
-    # (B) Create an explicit memory: short, searchable summary + tags
-    try:
-        mem_url = f"https://api.omi.me/v2/integrations/{OMI_APP_ID}/user/memories"
-        mem_headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        mem_params = {"uid": uid}
-
-        first_line = (text_content.splitlines() or [""])[0]
-        memory_content = first_line[:300]  # keep memory concise
-
-        mem_payload = {
-            "text": text_content,
-            "text_source": "other",
-            "text_source_spec": "rizz_meter",
-            "memories": [
-                {
-                    "content": memory_content,
-                    "tags": ["rizz_report", "dating", "post-date"]
-                }
-            ]
-        }
-
-        mem_resp = await http_client.post(mem_url, headers=mem_headers, params=mem_params,
-                                          json=mem_payload, timeout=30.0)
-        if 200 <= mem_resp.status_code < 300:
-            print("✅ Memory created (Imports).")
-        else:
-            print(f"❌ Failed to create memory. Status: {mem_resp.status_code}")
-            print(f"Response body: {mem_resp.text}")
-    except Exception as e:
-        print(f"Error saving memory: {e}")
-
-# --- NEW: save partner profile memory ---
+# --- ONLY save key facts as a single memory ---
 async def save_partner_profile_memory(uid: str, profile: dict):
     api_key = _get_imports_token()
     if not OMI_APP_ID or not api_key or not http_client or not profile:
         return
 
-    def _join(items):
-        return ", ".join([x for x in items if isinstance(x, str) and x.strip()]) if items else ""
+    def _join(items, max_items=6):
+        arr = [x for x in items or [] if isinstance(x, str) and x.strip()]
+        if len(arr) > max_items:
+            arr = arr[:max_items]
+        return ", ".join(arr)
 
     summary = []
+    if profile.get("name"): summary.append(f"Name: {profile['name']}")
     if profile.get("birthday"): summary.append(f"Birthday: {profile['birthday']}")
     if _join(profile.get("hobbies")): summary.append(f"Hobbies: {_join(profile.get('hobbies'))}")
     if _join(profile.get("likes")): summary.append(f"Likes: {_join(profile.get('likes'))}")
@@ -409,7 +349,13 @@ async def save_partner_profile_memory(uid: str, profile: dict):
     if profile.get("work"): summary.append(f"Work: {profile['work']}")
     if profile.get("location"): summary.append(f"Location: {profile['location']}")
     if _join(profile.get("values")): summary.append(f"Values: {_join(profile.get('values'))}")
+    if _join(profile.get("green_flags"), max_items=4): summary.append(f"Green flags: {_join(profile.get('green_flags'), 4)}")
+    if _join(profile.get("red_flags"), max_items=4): summary.append(f"Red flags: {_join(profile.get('red_flags'), 4)}")
+    if _join(profile.get("other_facts"), max_items=4): summary.append(f"Other: {_join(profile.get('other_facts'), 4)}")
+
     content_line = "Partner profile — " + " | ".join(summary) if summary else "Partner profile — (minimal data)"
+    # keep memory concise/safe for push limits
+    content_line = content_line[:600]
 
     url = f"https://api.omi.me/v2/integrations/{OMI_APP_ID}/user/memories"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -489,38 +435,29 @@ def _compact_transcript_text(segments: List[TranscriptSegment], max_chars: int =
     return out[-max_chars:]
 
 async def generate_topic_nudges(segments: List[TranscriptSegment], title_hint: Optional[str]) -> Optional[str]:
-    # Build a compact body (OK even if it's only user lines or very short)
     body = _compact_transcript_text(segments or [], 1200)
-
-    # Try to find a non-user speaker to personalize; otherwise use a neutral label
     target = next(
         (s.speaker for s in reversed(segments or [])
          if (s.speaker or "").lower() != "you" and (s.text or "").strip()),
         "your date"
     )
-
     sys = DEEPSEEK_NUDGE_SYSTEM_PROMPT.replace("{max_chars}", str(NUDGE_MAX_CHARS))
     user_content = (
         f"Direct your suggestions toward {target}. "
         f"If context is thin, infer plausible adjacent topics from general small-talk heuristics.\n\n"
         f"Title hint: {title_hint or 'Date'}\n\nTranscript:\n{body}"
     )
-
     messages = [
         {"role": "system", "content": sys},
         {"role": "user", "content": user_content}
     ]
-
-    # Use deepseek-chat (not reasoner) + stop at newline to force a single line
     text = await call_deepseek(
         messages,
         temperature=0.6,
         max_tokens=64,
-        model=DEEPSEEK_NUDGE_MODEL,   # 'deepseek-chat' by default
+        model=DEEPSEEK_NUDGE_MODEL,
         stop=["\n"]
     )
-
-    # Fallbacks to guarantee an output even if API returns empty content
     if not text:
         fallback_sys = (
             f"ALWAYS respond with exactly one line starting with 'Try:' and <= {NUDGE_MAX_CHARS} chars. "
@@ -533,11 +470,8 @@ async def generate_topic_nudges(segments: List[TranscriptSegment], title_hint: O
             model="deepseek-chat",
             stop=["\n"]
         )
-
     if not text:
-        # Absolute last resort: deterministic, partner-focused default
         return "Try: their weekend plans • favorite cuisines • a recent show they liked"
-
     line = text.strip().splitlines()[0]
     if not line.lower().startswith("try:"):
         line = "Try: " + line
@@ -594,14 +528,22 @@ async def _silence_monitor(uid: str):
                     with_data = list(state.buffer[-10:])
                     title_hint = state.title
                     state.last_buzz_wall_ts = now_ts
-
             if with_data:
-                suggestion = await generate_topic_nudges(with_data, title_hint)
+                try:
+                    suggestion = await generate_topic_nudges(with_data, title_hint)
+                except Exception as e:
+                    print(f"❌ Nudge generation error: {e}")
+                    suggestion = None
                 if not suggestion:
                     suggestion = "Try: weekend plans • favorite food • a recent movie/show"
-                await send_notification(uid, title="💡 Conversation nudge", body=suggestion)
+                try:
+                    await send_notification(uid, title="💡 Conversation nudge", body=suggestion)
+                except Exception as e:
+                    print(f"❌ Nudge push error: {e}")
     except asyncio.CancelledError:
         pass
+    except Exception as e:
+        print(f"🛑 Silence monitor crashed: {e}")
 
 def _ensure_silence_monitor(state: ConvState, uid: str):
     if (state.silence_task is None) or state.silence_task.done():
@@ -634,26 +576,23 @@ async def _finalize_and_analyze_UNLOCKED(state: ConvState, uid: str) -> Dict:
         summary = {"status": "error", "message": "Not enough segments to analyze."}
     else:
         llm_report_string = await llm_analyze(clean_segments, title)
-
         if llm_report_string:
             report_title = "Your Rizz Report is Ready"
             report_body = llm_report_string
-
             push_uid = state.last_uid or uid
             if push_uid:
                 print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 📣 Pushing (LLM-String) to uid='{push_uid}'")
+                # send a notification with the full report text
                 await send_notification(push_uid, title=report_title, body=report_body)
+                # store the report as a CONVERSATION only (not as a memory)
                 await create_conversation(push_uid, report_body)
-                await save_text_as_memory(push_uid, report_body)
-
-                # Extract + save partner profile memory
+                # Extract + save ONLY the key facts as a single memory
                 try:
                     profile = await extract_partner_profile(clean_segments)
                     if profile:
                         await save_partner_profile_memory(push_uid, profile)
                 except Exception as e:
                     print(f"⚠️ profile extraction/save error: {e}")
-
             summary = {"status": "success", "summary": {"report": report_body}}
         else:
             print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ⚠️ LLM unavailable. No analysis performed.")
@@ -666,7 +605,6 @@ async def _finalize_and_analyze_UNLOCKED(state: ConvState, uid: str) -> Dict:
     state.last_uid = None
     state.touch_wall()
     state.last_seg_end = 0.0
-    # stop silence monitor
     task = state.silence_task
     state.silence_task = None
     if task and not task.done():
@@ -772,6 +710,3 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     print(f"Starting Rizz Meter server on http://0.0.0.0:{port} (pid={PID})")
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
-
-
-
