@@ -385,22 +385,22 @@ def prepare_transcript_for_llm(segments: List[TranscriptSegment]) -> List[Dict[s
         if s.text and s.text.strip()
     ]
 
-DEEPSEEK_SYSTEM_PROMPT = """You are an expert social-conversation analyst for post-date debriefs.
-Your job: read the transcript and return a STRUCTURED JSON assessment focused on dating-relevant signals:
-- Reciprocity & turn-taking (talk-time balance, interruptions, back-channels)
-- Attentiveness (question rate, follow-ups referencing prior details)
-- Warmth (sentiment trajectory, acknowledgments, appreciation)
-- Comfort & pacing (speaking-rate stability, pause tolerance, laughter)
-- Boundary respect (honoring avoidant topics, not pushing after “no”)
-Compute normalized sub-scores (0–100) for: Reciprocity, Attentiveness, Warmth, Comfort, Boundary, Chemistry.
-Aggregate to a final 0–100 “Date Rizz” score. Provide 2–3 highlights and 2–3 improvement tips.
-Provide a short “highlights_reel” with 2–5 concrete moments (timestamp + quote + why it matters).
-Provide 3–5 “suggested_prompts” to use next time.
-Return ONLY JSON following the exact schema. No extra commentary."""
+DEEPSEEK_SYSTEM_PROMPT = """You are an expert social-conversation analyst.
+Your job is to read the transcript and *always* return a complete, valid, STRUCTURED JSON assessment, *no matter how short or incomplete the transcript is*.
+
+Even if the transcript is very short (e.g., only 1-2 lines) or lacks substance, you must *still* perform your full analysis to the best of your ability:
+- Do *not* use default scores. Analyze what little information you have and provide your best-effort scores for Reciprocity, Attentiveness, Warmth, Comfort, Boundary, and Chemistry.
+- Do your best to generate 1-2 highlights and 1-2 improvement tips, even if they have to be more general due to the lack of context.
+- Do your best to generate 1-2 `suggested_prompts`.
+- Set the `confidence_score` (0-100) to reflect how confident you are in your analysis, based on the transcript's length, turn-taking, and substance. A very short transcript should result in a very low confidence score.
+
+Return ONLY the JSON. Do not add any extra commentary or refusal text."""
 
 def deepseek_user_prompt(transcript_json: List[Dict[str, Any]], title_hint: Optional[str]) -> str:
+    # --- START MODIFICATION ---
     schema = {
         "title": "string (<= 80 chars; use first meaningful utterance if not provided)",
+        "confidence_score": "int 0-100 (See rubric for definition)", # <-- This is still needed
         "final_score": "int 0-100",
         "subscores": {
             "reciprocity": {"score": "int 0-100", "balance": "string", "interruptions": "int", "backchannels": "int"},
@@ -419,6 +419,7 @@ def deepseek_user_prompt(transcript_json: List[Dict[str, Any]], title_hint: Opti
         "generated_at": "ISO-8601 datetime string in UTC"
     }
     rubric = {
+        "confidence_score": "A 0-100 score of your confidence in this analysis, based on the transcript's length and substance. 0-30 = Low confidence (very short/incomplete). 30-70 = Mid confidence (partial talk). 70-100 = High confidence (rich conversation).", # <-- Definition
         "normalization": "Consider total duration and #turns; avoid penalizing short talks.",
         "aggregation": "Weighting guidance (can adapt): R=0.18, A=0.18, W=0.18, C=0.18, B=0.14, Ch=0.10. Clamp 0–100.",
         "definitions": {
@@ -427,6 +428,7 @@ def deepseek_user_prompt(transcript_json: List[Dict[str, Any]], title_hint: Opti
             "boundary": "Respect for topic declines or explicit 'no'."
         }
     }
+    # --- END MODIFICATION ---
     return json.dumps({
         "title_hint": (title_hint or "")[:80],
         "scoring_rubric": rubric,
@@ -503,6 +505,8 @@ async def deepseek_ping():
     # --- End of New Robust Error Handling ---
 
 def transform_llm_to_metrics(llm: dict, fallback_segments: List[TranscriptSegment]) -> Tuple[Dict[str, Dict], int, List[str], List[str], Dict[str, Any]]:
+    # ... (code for sub, pull, and metrics remains the same) ...
+    
     subs = llm.get("subscores", {})
     def pull(name, default=50):
         return int(subs.get(name, {}).get("score", default))
@@ -522,11 +526,16 @@ def transform_llm_to_metrics(llm: dict, fallback_segments: List[TranscriptSegmen
     final_score = int(llm.get("final_score", compute_final_score(metrics)))
     highlights = list(llm.get("highlights", []))[:3]
     improvements = list(llm.get("improvements", []))[:3]
+
+    # --- START MODIFICATION ---
     extras = {
+        "confidence_score": int(llm.get("confidence_score", 50)), # <-- ADDED
         "highlights_reel": llm.get("highlights_reel", []),
         "suggested_prompts": llm.get("suggested_prompts", []),
         "generated_at": llm.get("generated_at", datetime.now(timezone.utc).isoformat())
     }
+    # --- END MODIFICATION ---
+    
     return metrics, final_score, highlights, improvements, extras
 
 # =========================
@@ -951,6 +960,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     print(f"Starting Rizz Meter server on http://0.0.0.0:{port} (pid={PID})")
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
 
 
 
