@@ -5,11 +5,12 @@ import asyncio
 import statistics
 import requests
 import uvicorn
+import json
 from datetime import datetime, timezone
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict, Tuple, Any
 from fastapi import FastAPI, Query
 from pydantic import BaseModel, Field
-from contextlib import asynccontextmanager  # <-- FIX 1: IMPORT
+from contextlib import asynccontextmanager
 
 # =========================
 # Env / constants
@@ -17,10 +18,14 @@ from contextlib import asynccontextmanager  # <-- FIX 1: IMPORT
 OMI_APP_ID = os.environ.get("OMI_APP_ID")
 OMI_APP_SECRET = os.environ.get("OMI_APP_SECRET")
 
-# Auto-finalization knobs
-IDLE_TIMEOUT_SEC = int(os.environ.get("IDLE_TIMEOUT_SEC", "180"))    # wall-clock idle -> finalize on next batch
-MAX_SEG_GAP_SEC = float(os.environ.get("MAX_SEG_GAP_SEC", "120"))    # audio timeline gap -> finalize on next batch
+# DeepSeek
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-reasoner")
+DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
 
+# Auto-finalization knobs
+IDLE_TIMEOUT_SEC = int(os.environ.get("IDLE_TIMEOUT_SEC", "180"))
+MAX_SEG_GAP_SEC = float(os.environ.get("MAX_SEG_GAP_SEC", "120"))
 PID = os.getpid()
 
 # =========================
@@ -62,54 +67,42 @@ class RTIncomingSegment(BaseModel):
 
 class RTTranscriptBatch(BaseModel):
     segments: List[RTIncomingSegment]
-    session_id: Optional[str] = None    # treated as uid fallback
-    uid: Optional[str] = None           # accepted too
+    session_id: Optional[str] = None
+    uid: Optional[str] = None
 
 # =========================
-# Optional NLP (Loaded in Lifespan)
+# Optional NLP (kept only for fallback)
 # =========================
 HF_PIPELINE = None
 VADER = None
 
-# =========================
-# FIX 1: Lifespan Manager
-# =========================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # This code runs ON STARTUP
     global HF_PIPELINE, VADER
-    print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🚀 Server starting up, loading models...")
-    
+    print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🚀 Server starting up...")
     try:
         from transformers import pipeline
         HF_PIPELINE = pipeline("sentiment-analysis")
         print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ✅ HF Pipeline loaded.")
     except Exception as e:
-        print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ❌ ERROR: Failed to load HF_PIPELINE: {e}")
+        print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ⚠️ HF pipeline not loaded: {e}")
         HF_PIPELINE = None
-
     try:
         from nltk.sentiment import SentimentIntensityAnalyzer
         VADER = SentimentIntensityAnalyzer()
         print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ✅ VADER loaded.")
     except Exception as e:
-        print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ❌ ERROR: Failed to load VADER: {e}")
+        print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ⚠️ VADER not loaded: {e}")
         VADER = None
-    
     yield
-    
-    # This code runs ON SHUTDOWN
-    print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 👋 Server shutting down, clearing models...")
     HF_PIPELINE = None
     VADER = None
+    print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 👋 Server shutting down...")
+
+app = FastAPI(title="Rizz Meter Server", lifespan=lifespan)
 
 # =========================
-# App Initialization
-# =========================
-app = FastAPI(title="Rizz Meter Server", lifespan=lifespan) # <-- FIX 1: PASS LIFESPAN
-
-# =========================
-# Heuristics/utilities
+# Heuristics/utilities (kept for fallback & helpers)
 # =========================
 POSITIVE_WORDS = {"great","awesome","cool","love","amazing","thank you","thanks","wonderful","fantastic","appreciate"}
 APPRECIATION_PATTERNS = [r"\b(thanks|thank you|appreciate|that’s great|so glad)\b"]
@@ -117,9 +110,8 @@ LAUGHTER_PATTERNS = [r"\b(lol|haha|lmao|rofl|\[laughs\]|(ha){2,})\b"]
 BACKCHANNELS = {"yeah","uh-huh","mm-hmm","right","gotcha","i see","ok","okay","mhmm","yup"}
 BOUNDARY_PHRASES = [r"\b(not comfortable|don’t want to talk|rather not|can we change the topic|let’s change the topic|no, thanks)\b"]
 
-# Start / End markers — broader & case-insensitive
 START_RE = re.compile(r"\bconversation\s*starts\b", re.I)
-END_RE   = re.compile(r"\bconversa(?:i?t)ion\s*end(?:s)?\b", re.I)  # matches 'conversation end'/'ends' + typo 'conversaition'
+END_RE   = re.compile(r"\bconversa(?:i?t)ion\s*end(?:s)?\b", re.I)
 
 def clamp01(x: float) -> float:
     return max(0.0, min(1.0, x))
@@ -140,9 +132,7 @@ def avg(lst: List[float]) -> float:
 def safe_var(lst: List[float]) -> float:
     return statistics.pvariance(lst) if len(lst) >= 2 else 0.0
 
-# =========================
-# Analytics (same as before)
-# =========================
+# (your original heuristic analyzers preserved here for fallback only)
 def analyze_reciprocity(segments: List[TranscriptSegment]) -> Dict:
     talk_time: Dict[str, float] = {}
     for seg in segments:
@@ -338,7 +328,17 @@ def analyze_chemistry(segments: List[TranscriptSegment]) -> Dict:
     score = clamp01(0.6*resp_rate + 0.4*sync_rate)
     return {"score": to_0_100(score), "qa_responsiveness": round(resp_rate,2), "positivity_synchrony": round(sync_rate,2)}
 
-WEIGHTS = {"Reciprocity": 0.18, "Attentiveness": 0.18, "Warmth": 0.18, "Comfort": 0.18, "Boundary": 0.14, "Chemistry": 0.10, "Interruptions": 0.0, "Backchannels": 0.0, "FollowUps": 0.0}
+WEIGHTS = {"Reciprocity": 0.18, "Attentiveness": 0.18, "Warmth": 0.18, "Comfort": 0.18, "Boundary": 0.14, "Chemistry": 0.10,
+           "Interruptions": 0.0, "Backchannels": 0.0, "FollowUps": 0.0}
+
+def compute_final_score(metrics: Dict[str, Dict]) -> int:
+    total = 0.0
+    for name, w in WEIGHTS.items():
+        if w == 0:
+            continue
+        s = metrics.get(name, {}).get("score", 0)
+        total += w * s
+    return int(round(total))
 
 def summarize_strengths_and_tips(metrics: Dict[str, Dict]) -> Tuple[List[str], List[str]]:
     strengths, tips = [], []
@@ -372,17 +372,133 @@ def summarize_strengths_and_tips(metrics: Dict[str, Dict]) -> Tuple[List[str], L
         tips.append("Reference their words: “Earlier you mentioned __—tell me more?”")
     return strengths[:2], tips[:2]
 
-def compute_final_score(metrics: Dict[str, Dict]) -> int:
-    total = 0.0
-    for name, w in WEIGHTS.items():
-        if w == 0:
-            continue
-        s = metrics.get(name, {}).get("score", 0)
-        total += w * s
-    return int(round(total))
+# =========================
+# DeepSeek integration
+# =========================
+def prepare_transcript_for_llm(segments: List[TranscriptSegment]) -> List[Dict[str, Any]]:
+    return [
+        {
+            "start": round(float(s.start), 3),
+            "end": round(float(s.end), 3),
+            "speaker": s.speaker,
+            "text": s.text.strip(),
+        }
+        for s in segments
+        if s.text and s.text.strip()
+    ]
+
+DEEPSEEK_SYSTEM_PROMPT = """You are an expert social-conversation analyst for post-date debriefs.
+Your job: read the transcript and return a STRUCTURED JSON assessment focused on dating-relevant signals:
+- Reciprocity & turn-taking (talk-time balance, interruptions, back-channels)
+- Attentiveness (question rate, follow-ups referencing prior details)
+- Warmth (sentiment trajectory, acknowledgments, appreciation)
+- Comfort & pacing (speaking-rate stability, pause tolerance, laughter)
+- Boundary respect (honoring avoidant topics, not pushing after “no”)
+Compute normalized sub-scores (0–100) for: Reciprocity, Attentiveness, Warmth, Comfort, Boundary, Chemistry.
+Aggregate to a final 0–100 “Date Rizz” score. Provide 2–3 highlights and 2–3 improvement tips.
+Provide a short “highlights_reel” with 2–5 concrete moments (timestamp + quote + why it matters).
+Provide 3–5 “suggested_prompts” to use next time.
+Return ONLY JSON following the exact schema. No extra commentary."""
+
+def deepseek_user_prompt(transcript_json: List[Dict[str, Any]], title_hint: Optional[str]) -> str:
+    # We embed rubric + schema + data. The model must return strict JSON.
+    schema = {
+        "title": "string (<= 80 chars; use first meaningful utterance if not provided)",
+        "final_score": "int 0-100",
+        "subscores": {
+            "reciprocity": {"score": "int 0-100", "balance": "string", "interruptions": "int", "backchannels": "int"},
+            "attentiveness": {"score": "int 0-100", "question_rate_per_min": "float", "followups": "int", "examples": ["string", "..."]},
+            "warmth": {"score": "int 0-100", "sentiment_trend": "one of ['up','down','flat']", "positives": "int", "examples": ["string", "..."]},
+            "comfort": {"score": "int 0-100", "avg_pause_s": "float", "speaking_rate_cv": "float", "laughter_count": "int"},
+            "boundary": {"score": "int 0-100", "events": "int", "pushes_after_no": "int", "examples": ["string", "..."]},
+            "chemistry": {"score": "int 0-100", "qa_responsiveness": "float 0-1", "positivity_synchrony": "float 0-1"}
+        },
+        "highlights": ["string", "..."],
+        "improvements": ["string", "..."],
+        "highlights_reel": [
+            {"timestamp_s": "float", "text": "string", "why": "string"}
+        ],
+        "suggested_prompts": ["string", "..."],
+        "generated_at": "ISO-8601 datetime string in UTC"
+    }
+    rubric = {
+        "normalization": "Consider total duration and #turns; avoid penalizing short talks.",
+        "aggregation": "Weighting guidance (can adapt): R=0.18, A=0.18, W=0.18, C=0.18, B=0.14, Ch=0.10. Clamp 0–100.",
+        "definitions": {
+            "followup": "Question referencing a partner detail or keyword from earlier.",
+            "backchannel": "Brief listener cue (mm-hmm, yeah, right).",
+            "boundary": "Respect for topic declines or explicit 'no'."
+        }
+    }
+    return json.dumps({
+        "title_hint": (title_hint or "")[:80],
+        "scoring_rubric": rubric,
+        "required_schema": schema,
+        "transcript": transcript_json
+    })
+
+def call_deepseek(messages: List[Dict[str, str]], temperature: float = 0.2, max_tokens: int = 1500) -> Optional[dict]:
+    if not DEEPSEEK_API_KEY:
+        print("❌ DEEPSEEK_API_KEY not set; skipping LLM call.")
+        return None
+    url = f"{DEEPSEEK_BASE_URL}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": DEEPSEEK_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "response_format": {"type": "json_object"}
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=45)
+        if resp.status_code // 100 != 2:
+            print(f"❌ DeepSeek error {resp.status_code}: {resp.text}")
+            return None
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+        return json.loads(content)
+    except Exception as e:
+        print(f"❌ DeepSeek exception: {e}")
+        return None
+
+def transform_llm_to_metrics(llm: dict, fallback_segments: List[TranscriptSegment]) -> Tuple[Dict[str, Dict], int, List[str], List[str], Dict[str, Any]]:
+    """
+    Map LLM JSON into the same metric dictionary your app expects.
+    Also return final_score, highlights, improvements, and passthrough extras.
+    """
+    subs = llm.get("subscores", {})
+    def pull(name, default=50):
+        return int(subs.get(name, {}).get("score", default))
+
+    metrics = {
+        "Reciprocity": {"score": pull("reciprocity"), **{k:v for k,v in subs.get("reciprocity", {}).items() if k != "score"}},
+        "Attentiveness": {"score": pull("attentiveness"), **{k:v for k,v in subs.get("attentiveness", {}).items() if k != "score"}},
+        "Warmth": {"score": pull("warmth"), **{k:v for k,v in subs.get("warmth", {}).items() if k != "score"}},
+        "Comfort": {"score": pull("comfort"), **{k:v for k,v in subs.get("comfort", {}).items() if k != "score"}},
+        "Boundary": {"score": pull("boundary"), **{k:v for k,v in subs.get("boundary", {}).items() if k != "score"}},
+        "Chemistry": {"score": pull("chemistry"), **{k:v for k,v in subs.get("chemistry", {}).items() if k != "score"}},
+        # Support signals (optional)
+        "Interruptions": {"score": 100},  # can be filled from LLM if provided
+        "Backchannels": {"score": 100},
+        "FollowUps": {"score": 100},
+    }
+
+    final_score = int(llm.get("final_score", compute_final_score(metrics)))
+    highlights = list(llm.get("highlights", []))[:3]
+    improvements = list(llm.get("improvements", []))[:3]
+    extras = {
+        "highlights_reel": llm.get("highlights_reel", []),
+        "suggested_prompts": llm.get("suggested_prompts", []),
+        "generated_at": llm.get("generated_at", datetime.now(timezone.utc).isoformat())
+    }
+    return metrics, final_score, highlights, improvements, extras
 
 # =========================
-# Push helpers
+# Push helpers (unchanged)
 # =========================
 def send_notification(uid: str, title: str, body: str):
     print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) Attempting push to uid={uid}")
@@ -436,10 +552,9 @@ class ConvState:
         self.buffer: List[TranscriptSegment] = []
         self.title: Optional[str] = None
         self.last_uid: Optional[str] = None
-        self.last_wall_ts: float = 0.0    # wall-clock timestamp of last activity
-        self.last_seg_end: float = 0.0    # last audio timeline end
+        self.last_wall_ts: float = 0.0
+        self.last_seg_end: float = 0.0
         self.lock = asyncio.Lock()
-
     def touch_wall(self):
         self.last_wall_ts = datetime.now(timezone.utc).timestamp()
 
@@ -478,22 +593,59 @@ async def _get_state(uid: str) -> ConvState:
         return CONVS[uid]
 
 # =========================
-# FIX 2: Deadlock Fix
+# Finalization using LLM first (fallback to heuristics)
 # =========================
+def llm_analyze(segments: List[TranscriptSegment], title_hint: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not segments:
+        return None
+    transcript_json = prepare_transcript_for_llm(segments)
+    messages = [
+        {"role": "system", "content": DEEPSEEK_SYSTEM_PROMPT},
+        {"role": "user", "content": deepseek_user_prompt(transcript_json, title_hint)}
+    ]
+    return call_deepseek(messages)
+
+def fallback_analyze(clean_segments: List[TranscriptSegment]) -> Dict[str, Any]:
+    reciprocity = analyze_reciprocity(clean_segments)
+    interruptions = analyze_interruptions(clean_segments)
+    backchannels = analyze_backchannels(clean_segments)
+    attentiveness = analyze_attentiveness(clean_segments)
+    followups = analyze_followups(clean_segments)
+    warmth = analyze_sentiment(clean_segments)
+    comfort = analyze_comfort(clean_segments)
+    boundary = analyze_boundary_respect(clean_segments)
+    chemistry = analyze_chemistry(clean_segments)
+    metrics = {
+        "Reciprocity": reciprocity, "Interruptions": interruptions, "Backchannels": backchannels,
+        "Attentiveness": attentiveness, "FollowUps": followups, "Warmth": warmth,
+        "Comfort": comfort, "Boundary": boundary, "Chemistry": chemistry
+    }
+    final_score = compute_final_score(metrics)
+    strengths, tips = summarize_strengths_and_tips(metrics)
+    return {
+        "status": "success",
+        "summary": {
+            "title": "Conversation",
+            "final_score": final_score,
+            "subscores": {
+                "reciprocity": reciprocity, "attentiveness": attentiveness, "warmth": warmth,
+                "comfort": comfort, "boundary": boundary, "chemistry": chemistry
+            },
+            "supporting_signals": {"interruptions": interruptions, "backchannels": backchannels, "followups": followups},
+            "highlights": strengths,
+            "improvements": tips,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "highlights_reel": [],
+            "suggested_prompts": []
+        }
+    }
 
 async def _finalize_and_analyze(uid: str) -> Dict:
-    """
-    Lock-acquiring wrapper for external calls (e.g., /conversation/end endpoint).
-    """
     state = await _get_state(uid)
     async with state.lock:
         return _finalize_and_analyze_UNLOCKED(state, uid)
 
 def _finalize_and_analyze_UNLOCKED(state: ConvState, uid: str) -> Dict:
-    """
-    Analyzes the buffer, sends push, and resets state.
-    Assumes state.lock is ALREADY HELD.
-    """
     segs = list(state.buffer)
     print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🔔 Finalizing uid={uid} with {len(segs)} segments")
 
@@ -503,57 +655,53 @@ def _finalize_and_analyze_UNLOCKED(state: ConvState, uid: str) -> Dict:
                 t = s.text.strip()
                 if t:
                     yield t
+
     title = state.title or next((t[:60] for t in non_marker_texts()), "Conversation")
     clean_segments = [s for s in segs if not _is_start_marker(s.text) and not _is_end_marker(s.text)]
-
     if len(clean_segments) < 2:
         print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ⚠️ Not enough segments to analyze (uid={uid}).")
         summary = {"status": "error", "message": "Not enough segments to analyze."}
     else:
-        # analytics
-        reciprocity = analyze_reciprocity(clean_segments)
-        interruptions = analyze_interruptions(clean_segments)
-        backchannels = analyze_backchannels(clean_segments)
-        attentiveness = analyze_attentiveness(clean_segments)
-        followups = analyze_followups(clean_segments)
-        warmth = analyze_sentiment(clean_segments)
-        comfort = analyze_comfort(clean_segments)
-        boundary = analyze_boundary_respect(clean_segments)
-        chemistry = analyze_chemistry(clean_segments)
-        metrics = {
-            "Reciprocity": reciprocity, "Interruptions": interruptions, "Backchannels": backchannels,
-            "Attentiveness": attentiveness, "FollowUps": followups, "Warmth": warmth,
-            "Comfort": comfort, "Boundary": boundary, "Chemistry": chemistry
-        }
-        final_score = compute_final_score(metrics)
-        strengths, tips = summarize_strengths_and_tips(metrics)
-        body = compose_notification(title, final_score, metrics, strengths, tips)
-        push_uid = state.last_uid or uid
-        if push_uid:
-            print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 📣 Pushing to uid='{push_uid}', score={final_score}")
-            send_notification(push_uid, title="Your Rizz Report is Ready", body=body)
-        else:
-            print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🔕 No uid to push")
-
-        summary = {
-            "status": "success",
-            "summary": {
-                "title": title,
-                "final_score": final_score,
-                "subscores": {
-                    "reciprocity": reciprocity, "attentiveness": attentiveness, "warmth": warmth,
-                    "comfort": comfort, "boundary": boundary, "chemistry": chemistry
-                },
-                "supporting_signals": {
-                    "interruptions": interruptions, "backchannels": backchannels, "followups": followups
-                },
-                "highlights": strengths,
-                "improvements": tips,
-                "generated_at": datetime.now(timezone.utc).isoformat()
+        # 1) Try LLM
+        llm = llm_analyze(clean_segments, title)
+        if llm:
+            metrics, final_score, strengths, tips, extras = transform_llm_to_metrics(llm, clean_segments)
+            body = compose_notification(title, final_score, metrics, strengths, tips)
+            push_uid = state.last_uid or uid
+            if push_uid:
+                print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 📣 Pushing (LLM) to uid='{push_uid}', score={final_score}")
+                send_notification(push_uid, title="Your Rizz Report is Ready", body=body)
+            summary = {
+                "status": "success",
+                "summary": {
+                    "title": title,
+                    "final_score": final_score,
+                    "subscores": {
+                        "reciprocity": metrics["Reciprocity"],
+                        "attentiveness": metrics["Attentiveness"],
+                        "warmth": metrics["Warmth"],
+                        "comfort": metrics["Comfort"],
+                        "boundary": metrics["Boundary"],
+                        "chemistry": metrics["Chemistry"],
+                    },
+                    "supporting_signals": {
+                        "interruptions": metrics.get("Interruptions", {}),
+                        "backchannels": metrics.get("Backchannels", {}),
+                        "followups": metrics.get("FollowUps", {}),
+                    },
+                    "highlights": strengths,
+                    "improvements": tips,
+                    "generated_at": extras.get("generated_at", datetime.now(timezone.utc).isoformat()),
+                    "highlights_reel": extras.get("highlights_reel", []),
+                    "suggested_prompts": extras.get("suggested_prompts", [])
+                }
             }
-        }
+        else:
+            # 2) Fallback heuristics if LLM fails
+            print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ⚠️ LLM unavailable — using fallback heuristics.")
+            summary = fallback_analyze(clean_segments)
 
-    # reset state
+    # Reset state
     state.active = False
     state.buffer = []
     state.title = None
@@ -567,7 +715,12 @@ def _finalize_and_analyze_UNLOCKED(state: ConvState, uid: str) -> Dict:
 # =========================
 @app.get("/")
 async def health():
-    return {"status": "ok", "omi_creds_loaded": bool(OMI_APP_ID and OMI_APP_SECRET), "pid": PID}
+    return {
+        "status": "ok",
+        "omi_creds_loaded": bool(OMI_APP_ID and OMI_APP_SECRET),
+        "deepseek_ready": bool(DEEPSEEK_API_KEY),
+        "pid": PID
+    }
 
 @app.post("/transcript_processed")
 async def transcript_processed(
@@ -576,17 +729,6 @@ async def transcript_processed(
     force_start: Optional[int] = Query(0),
     force_end: Optional[int] = Query(0),
 ):
-    """
-    Real-time ingest.
-    - uid read from: body.uid -> query ?uid= -> session_id
-    - Start on text 'conversation starts' (case-insensitive)
-      OR if ?force_start=1 is passed.
-    - End on 'conversation end'/'ends'/'conversaition ends'
-      OR if ?force_end=1 is passed.
-    - Auto-finalize if either:
-        * wall-clock idle > IDLE_TIMEOUT_SEC (finalize on next batch), or
-        * audio timeline gap > MAX_SEG_GAP_SEC (finalize on next batch).
-    """
     if not batch.segments and not force_end and not force_start:
         return {"status": "ignored", "reason": "no_segments", "pid": PID}
 
@@ -599,29 +741,24 @@ async def transcript_processed(
     source = "body.uid" if batch.uid else ("query.uid" if uid else "session_id")
     print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🔗 uid set from {source}: {effective_uid}")
 
-    # Detect markers in this batch
     has_start = any(_is_start_marker(s.text) for s in (batch.segments or []))
     has_end   = any(_is_end_marker(s.text) for s in (batch.segments or []))
 
     async with state.lock:
         now_ts = datetime.now(timezone.utc).timestamp()
 
-        # Soft auto-finalize if previously active and idle too long (handled on arrival of any new batch)
+        # Soft auto-finalize on idle (previous active convo)
         if state.active and state.last_wall_ts and (now_ts - state.last_wall_ts > IDLE_TIMEOUT_SEC) and state.buffer:
             print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ⏰ Idle timeout (wall) for uid={effective_uid}. Auto-finalizing previous convo.")
-            # FIX 2: Call UNLOCKED version
             _finalize_and_analyze_UNLOCKED(state, effective_uid)
 
-        # Manual overrides
         if force_end:
             print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🛑 force_end received for uid={effective_uid}")
-            # FIX 2: Call UNLOCKED version
             return _finalize_and_analyze_UNLOCKED(state, effective_uid)
 
         if has_start or force_start:
             if state.active and state.buffer:
                 print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🔄 start while active (uid={effective_uid}) — auto-finalizing previous.")
-                # FIX 2: Call UNLOCKED version
                 _finalize_and_analyze_UNLOCKED(state, effective_uid)
             state.active = True
             state.buffer = []
@@ -634,65 +771,81 @@ async def transcript_processed(
             state.touch_wall()
             return {"status": "ignored", "reason": "not_started", "pid": PID}
 
-        # Buffer incoming segments and check audio timeline gaps
+        # Buffer and gap check
         audio_gap_trigger = False
         for seg in batch.segments or []:
             internal = _rt_to_internal(seg)
-            # conversation title from first non-marker text
             if state.title is None and internal.text.strip() and not _is_start_marker(internal.text) and not _is_end_marker(internal.text):
                 state.title = internal.text.strip()[:60]
 
-            # detect audio gap from last_seg_end
             if state.last_seg_end and (internal.end - state.last_seg_end) > MAX_SEG_GAP_SEC:
                 audio_gap_trigger = True
             state.last_seg_end = max(state.last_seg_end, internal.end)
-
             state.buffer.append(internal)
 
         state.touch_wall()
 
         if has_end:
             print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🟥 end marker detected — finalizing (uid={effective_uid})")
-            # FIX 2: Call UNLOCKED version
             return _finalize_and_analyze_UNLOCKED(state, effective_uid)
 
         if audio_gap_trigger and state.buffer:
             print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ⏰ Large audio gap detected (> {MAX_SEG_GAP_SEC}s). Auto-finalizing (uid={effective_uid}).")
-            # FIX 2: Call UNLOCKED version
             return _finalize_and_analyze_UNLOCKED(state, effective_uid)
 
         print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🔄 Buffering: total segments={len(state.buffer)} (uid={effective_uid})")
         return {"status": "buffering", "segments_buffered": len(state.buffer), "will_push_on_end": True, "pid": PID}
 
-# Manual end endpoint (handy if markers were missed)
 @app.post("/conversation/end")
 async def conversation_end(uid: str = Query(...)):
     print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🛑 /conversation/end called for uid={uid}")
-    # This correctly calls the LOCKING wrapper
     return await _finalize_and_analyze(uid)
 
-# Back-compat endpoint (memory_created)
 @app.post("/memory_created")
 async def analyze_memory(memory: Memory, uid: str):
     print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🎉 Analyzing Memory: {memory.structured.title} for uid: {uid}")
     segments = memory.transcript_segments
     if len(segments) < 2:
         return {"status": "error", "message": "Not enough segments."}
-    reciprocity = analyze_reciprocity(segments)
-    interruptions = analyze_interruptions(segments)
-    backchannels = analyze_backchannels(segments)
-    attentiveness = analyze_attentiveness(segments)
-    followups = analyze_followups(segments)
-    warmth = analyze_sentiment(segments)
-    comfort = analyze_comfort(segments)
-    boundary = analyze_boundary_respect(segments)
-    chemistry = analyze_chemistry(segments)
-    metrics = {"Reciprocity": reciprocity, "Interruptions": interruptions, "Backchannels": backchannels, "Attentiveness": attentiveness, "FollowUps": followups, "Warmth": warmth, "Comfort": comfort, "Boundary": boundary, "Chemistry": chemistry}
-    final_score = compute_final_score(metrics)
-    strengths, tips = summarize_strengths_and_tips(metrics)
-    body = compose_notification(memory.structured.title, final_score, metrics, strengths, tips)
-    send_notification(uid, title="Your Rizz Report is Ready", body=body)
-    return {"status": "success", "summary": {"title": memory.structured.title, "final_score": final_score, "subscores": {"reciprocity": reciprocity, "attentiveness": attentiveness, "warmth": warmth, "comfort": comfort, "boundary": boundary, "chemistry": chemistry}, "supporting_signals": {"interruptions": interruptions, "backchannels": backchannels, "followups": followups}, "highlights": strengths, "improvements": tips, "generated_at": datetime.now(timezone.utc).isoformat()}}
+
+    # Prefer LLM; fallback to heuristics
+    llm = llm_analyze(segments, memory.structured.title)
+    if llm:
+        metrics, final_score, strengths, tips, extras = transform_llm_to_metrics(llm, segments)
+        body = compose_notification(memory.structured.title, final_score, metrics, strengths, tips)
+        send_notification(uid, title="Your Rizz Report is Ready", body=body)
+        return {"status": "success", "summary": {
+            "title": memory.structured.title,
+            "final_score": final_score,
+            "subscores": {
+                "reciprocity": metrics["Reciprocity"], "attentiveness": metrics["Attentiveness"], "warmth": metrics["Warmth"],
+                "comfort": metrics["Comfort"], "boundary": metrics["Boundary"], "chemistry": metrics["Chemistry"]
+            },
+            "supporting_signals": {
+                "interruptions": metrics.get("Interruptions", {}), "backchannels": metrics.get("Backchannels", {}), "followups": metrics.get("FollowUps", {})
+            },
+            "highlights": strengths, "improvements": tips,
+            "generated_at": extras.get("generated_at", datetime.now(timezone.utc).isoformat()),
+            "highlights_reel": extras.get("highlights_reel", []),
+            "suggested_prompts": extras.get("suggested_prompts", [])
+        }}
+
+    # Fallback if LLM unavailable
+    fb = fallback_analyze(segments)
+    send_notification(uid, title="Your Rizz Report is Ready", body=compose_notification(
+        fb["summary"]["title"], fb["summary"]["final_score"],
+        {
+            "Reciprocity": fb["summary"]["subscores"]["reciprocity"],
+            "Attentiveness": fb["summary"]["subscores"]["attentiveness"],
+            "Warmth": fb["summary"]["subscores"]["warmth"],
+            "Comfort": fb["summary"]["subscores"]["comfort"],
+            "Boundary": fb["summary"]["subscores"]["boundary"],
+            "Chemistry": fb["summary"]["subscores"]["chemistry"],
+        },
+        fb["summary"]["highlights"],
+        fb["summary"]["improvements"]
+    ))
+    return fb
 
 # =========================
 # Entrypoint
@@ -700,6 +853,4 @@ async def analyze_memory(memory: Memory, uid: str):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     print(f"Starting Rizz Meter server on http://0.0.0.0:{port} (pid={PID})")
-    # Keep single worker in prod to avoid split memory problems, or persist state to Redis/DB if you need >1.
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
-
