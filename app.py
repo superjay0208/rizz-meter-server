@@ -208,11 +208,7 @@ def deepseek_user_prompt(transcript_json: List[Dict[str, Any]], title_hint: Opti
     transcript_str = json.dumps(transcript_json, indent=2)
     return f"Title hint (you can ignore if you find a better one): {title_hint}\n\nTranscript:\n{transcript_str}"
 
-async def call_deepseek(messages, temperature=0.2, max_tokens=2048) -> Optional[str]:
-    """
-    Calls the DeepSeek API and returns the raw text content string,
-    or None if it fails or returns empty content.
-    """
+async def call_deepseek(messages, temperature=0.2, max_tokens=2048, *, model: Optional[str] = None, stop: Optional[List[str]] = None) -> Optional[str]:
     if not DEEPSEEK_API_KEY:
         print("❌ DeepSeek: DEEPSEEK_API_KEY is not set.")
         return None
@@ -220,18 +216,17 @@ async def call_deepseek(messages, temperature=0.2, max_tokens=2048) -> Optional[
         print("❌ DeepSeek: http_client is not initialized.")
         return None
 
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
     payload = {
-        "model": DEEPSEEK_MODEL,
+        "model": (model or DEEPSEEK_MODEL),
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens
     }
-    url = f"{DEEPSEEK_BASE_URL.rstrip('/')}/chat/completions"
+    if stop:
+        payload["stop"] = stop
 
+    url = f"{DEEPSEEK_BASE_URL.rstrip('/')}/chat/completions"
     for attempt in range(3):
         try:
             resp = await http_client.post(url, headers=headers, json=payload, timeout=200.0)
@@ -255,21 +250,19 @@ async def call_deepseek(messages, temperature=0.2, max_tokens=2048) -> Optional[
             choice = data.get("choices", [{}])[0]
             message = choice.get("message", {})
             content = message.get("content")
-
             if not content:
                 reasoning = message.get("reasoning_content", "No reasoning provided.")
                 finish_reason = choice.get("finish_reason", "No finish reason.")
                 print(f"❌ DeepSeek: Returned empty content. FinishReason: {finish_reason}. Reasoning: {reasoning[:500]}")
                 return None
-
             return content.strip()
-
         except Exception as e:
             print(f"❌ Parse error (generic): {e}. Full response preview: {resp.text[:400]}")
             return None
 
     print("❌ DeepSeek: retries exhausted.")
     return None
+
 
 @app.get("/deepseek/ping")
 async def deepseek_ping():
@@ -779,5 +772,6 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     print(f"Starting Rizz Meter server on http://0.0.0.0:{port} (pid={PID})")
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
 
 
