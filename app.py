@@ -3,7 +3,6 @@ import re
 import math
 import asyncio
 import statistics
-import requests # Still imported but not used for blocking calls
 import uvicorn
 import json
 import httpx   # <-- ADDED
@@ -12,6 +11,7 @@ from typing import List, Optional, Dict, Tuple, Any
 from fastapi import FastAPI, Query
 from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
+import time
 
 # =========================
 # Env / constants
@@ -29,6 +29,8 @@ IDLE_TIMEOUT_SEC = int(os.environ.get("IDLE_TIMEOUT_SEC", "180"))
 MAX_SEG_GAP_SEC = float(os.environ.get("MAX_SEG_GAP_SEC", "120"))
 PID = os.getpid()
 
+
+url = f"{DEEPSEEK_BASE_URL.rstrip('/')}/chat/completions"
 # =========================
 # Base models (memory_created)
 # =========================
@@ -436,65 +438,47 @@ def deepseek_user_prompt(transcript_json: List[Dict[str, Any]], title_hint: Opti
 
 # <<< MODIFIED: CONVERTED TO ASYNC DEF >>>
 # <<< MODIFIED: CONVERTED TO ASYNC DEF >>>
-async def call_deepseek(messages: List[Dict[str, str]], temperature: float = 0.2, max_tokens: int = 1500) -> Optional[dict]:
-    if not DEEPSEEK_API_KEY:
-        print("❌ DEEPSEEK_API_KEY not set; skipping LLM call.")
-        return None
-    if not http_client:
-        print("❌ HTTP Client not initialized; skipping LLM call.")
-        return None
-        
-    url = f"{DEEPSEEK_BASE_URL}/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "model": DEEPSEEK_MODEL,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "response_format": {"type": "json_object"}
-    }
-    
-    # --- Start of New Robust Error Handling ---
-    
-    try:
-        # 1. Handle Network/API Call Errors
-        resp = await http_client.post(url, headers=headers, json=payload, timeout=200.0)
-        
-    except httpx.ReadTimeout:
-        print("❌ DeepSeek call timed out.")
-        return None
-    except Exception as e:
-        print(f"❌ DeepSeek network exception: {e}")
-        return None
+async def call_deepseek(messages, temperature=0.2, max_tokens=1500) -> Optional[dict]:
+    ...
+    url = f"{DEEPSEEK_BASE_URL.rstrip('/')}/chat/completions"
+    for attempt in range(3):
+        try:
+            resp = await http_client.post(url, headers=headers, json=payload, timeout=200.0)
+        except httpx.ReadTimeout:
+            print(f"❌ DeepSeek timeout (attempt {attempt+1})")
+            continue
+        except Exception as e:
+            print(f"❌ DeepSeek network (attempt {attempt+1}): {e}")
+            await asyncio.sleep(1.5 * (attempt + 1))
+            continue
 
-    # 2. Handle API-level Errors (non-200 status)
-    if resp.status_code // 100 != 2:
-        print(f"❌ DeepSeek API error {resp.status_code}: {resp.text}")
-        return None
-    
-    # 3. Handle Response Structure Errors
-    try:
-        data = resp.json()
-        content = data["choices"][0]["message"]["content"]
-    except Exception as e:
-        print(f"❌ DeepSeek response structure error. Full response: {resp.text}")
-        print(f"Exception: {e}")
-        return None
+        if resp.status_code // 100 != 2:
+            print(f"❌ DeepSeek HTTP {resp.status_code} (attempt {attempt+1}): {resp.text[:400]}")
+            if resp.status_code in (429, 500, 502, 503, 504):
+                await asyncio.sleep(1.5 * (attempt + 1))
+                continue
+            return None
 
-    # 4. Handle JSON Parsing Errors (This is your specific error)
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError as e:
-        print(f"❌ DeepSeek failed to return valid JSON. Error: {e}")
-        print(f"--- Model Output Start ---\n{content}\n--- Model Output End ---")
-        return None
-    except Exception as e:
-        print(f"❌ Unknown error parsing DeepSeek content. Error: {e}")
-        print(f"--- Model Output Start ---\n{content}\n--- Model Output End ---")
-        return None
+        try:
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            return json.loads(content)  # you can keep your wrapper if you want to extract fenced JSON
+        except Exception as e:
+            print(f"❌ Parse error: {e}. Preview: {resp.text[:400]}")
+            return None
+
+    print("❌ DeepSeek: retries exhausted.")
+    return None
+
+
+@app.get("/deepseek/ping")
+async def deepseek_ping():
+    msgs = [
+        {"role":"system","content":"Return ONLY {\"ok\":true,\"ts\":\"<utc>\"}."},
+        {"role":"user","content":"Respond with ok=true and current UTC timestamp."}
+    ]
+    out = await call_deepseek(msgs, temperature=0.0, max_tokens=64)
+    return {"bridge_ok": bool(out), "raw": out}
     
     # --- End of New Robust Error Handling ---
 
@@ -947,5 +931,6 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     print(f"Starting Rizz Meter server on http://0.0.0.0:{port} (pid={PID})")
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
 
 
