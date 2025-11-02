@@ -305,18 +305,29 @@ async def save_text_as_memory(uid: str, text_content: str):
         print("❌ HTTP Client not initialized; skipping memory save.")
         return
 
-    url = "https://api.omi.me/v2/memories"
+    # --- START FIX ---
+    # The URL must match the integration pattern, just like the notification call
+    url = f"https://api.omi.me/v2/integrations/{OMI_APP_ID}/memories"
+    # --- END FIX ---
+
     headers = {
         "Authorization": f"Bearer {OMI_APP_SECRET}",
         "Content-Type": "application/json"
     }
+    
+    # This part remains the same:
+    # We pass the 'uid' as a query parameter
     params = {"uid": uid}
+    
+    # We pass the 'text' (and optionally app_id) in the JSON body
     payload = {
-        "text": text_content, # The text_content *is* the full report
+        "text": text_content, 
         "app_id": OMI_APP_ID
     }
 
     try:
+        # The httpx client correctly sends 'params' in the URL 
+        # and 'json' as the POST body.
         resp = await http_client.post(url, headers=headers, params=params, json=payload, timeout=15.0)
         
         if 200 <= resp.status_code < 300:
@@ -543,3 +554,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     print(f"Starting Rizz Meter server on http://0.0.0.0:{port} (pid={PID})")
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
