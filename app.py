@@ -29,8 +29,6 @@ IDLE_TIMEOUT_SEC = int(os.environ.get("IDLE_TIMEOUT_SEC", "180"))
 MAX_SEG_GAP_SEC = float(os.environ.get("MAX_SEG_GAP_SEC", "120"))
 PID = os.getpid()
 
-
-url = f"{DEEPSEEK_BASE_URL.rstrip('/')}/chat/completions"
 # =========================
 # Base models (memory_created)
 # =========================
@@ -439,15 +437,38 @@ def deepseek_user_prompt(transcript_json: List[Dict[str, Any]], title_hint: Opti
 # <<< MODIFIED: CONVERTED TO ASYNC DEF >>>
 # <<< MODIFIED: CONVERTED TO ASYNC DEF >>>
 async def call_deepseek(messages, temperature=0.2, max_tokens=1500) -> Optional[dict]:
-    ...
+    # --- START FIX ---
+    # Check for missing API key or client
+    if not DEEPSEEK_API_KEY:
+        print("❌ DeepSeek: DEEPSEEK_API_KEY is not set.")
+        return None
+    if not http_client:
+        print("❌ DeepSeek: http_client is not initialized.")
+        return None
+
+    # Define the headers and payload for the API request
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": DEEPSEEK_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens
+    }
+    # --- END FIX ---
+
     url = f"{DEEPSEEK_BASE_URL.rstrip('/')}/chat/completions"
     for attempt in range(3):
         try:
+            # These variables are now defined
             resp = await http_client.post(url, headers=headers, json=payload, timeout=200.0)
         except httpx.ReadTimeout:
             print(f"❌ DeepSeek timeout (attempt {attempt+1})")
             continue
         except Exception as e:
+            # This will now catch other potential errors, but not the NameError
             print(f"❌ DeepSeek network (attempt {attempt+1}): {e}")
             await asyncio.sleep(1.5 * (attempt + 1))
             continue
@@ -462,13 +483,12 @@ async def call_deepseek(messages, temperature=0.2, max_tokens=1500) -> Optional[
         try:
             data = resp.json()
             content = data["choices"][0]["message"]["content"]
-            return json.loads(content)  # you can keep your wrapper if you want to extract fenced JSON
+            return json.loads(content)
         except Exception as e:
             print(f"❌ Parse error: {e}. Preview: {resp.text[:400]}")
             return None
 
     print("❌ DeepSeek: retries exhausted.")
-    return None
 
 
 @app.get("/deepseek/ping")
@@ -931,6 +951,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     print(f"Starting Rizz Meter server on http://0.0.0.0:{port} (pid={PID})")
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
 
 
 
