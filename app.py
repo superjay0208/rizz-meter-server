@@ -69,7 +69,6 @@ http_client: Optional[httpx.AsyncClient] = None
 async def lifespan(app: FastAPI):
     global http_client
     print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🚀 Server starting up...")
-    # Initialize the client with a default timeout
     http_client = httpx.AsyncClient(timeout=45.0)
     try:
         yield
@@ -95,57 +94,96 @@ def prepare_transcript_for_llm(segments: List[TranscriptSegment]) -> List[Dict[s
         if s.text and s.text.strip()
     ]
 
-DEEPSEEK_SYSTEM_PROMPT = """You are an expert social-conversation analyst.
-Your job is to read the transcript and *always* return a complete, valid, STRUCTURED JSON assessment, *no matter how short or incomplete the transcript is*.
+# --- NEW METICULOUS PROMPT WITH FULL CONTEXT ---
+DEEPSEEK_SYSTEM_PROMPT = """You are an expert social-conversation analyst, specializing in dating.
+Your job is to read a transcript and return a single, formatted, plain-text "Post-Date Report".
 
-Even if the transcript is very short (e.g., only 1-2 lines) or lacks substance, you must *still* perform your full analysis to the best of your ability:
-- Do *not* use default scores. Analyze what little information you have and provide your best-effort scores for Reciprocity, Attentiveness, Warmth, Comfort, Boundary, and Chemistry.
-- Do your best to generate 1-2 highlights and 1-2 improvement tips, even if they have to be more general due to the lack of context.
-- Do your best to generate 1-2 `suggested_prompts`.
-- Set the `confidence_score` (0-100) to reflect how confident you are in your analysis, based on the transcript's length, turn-taking, and substance. A very short transcript should result in a very low confidence score.
+*DO NOT* use JSON. *DO NOT* add any commentary, greetings, or text before or after the report.
+Your entire response *must* be the report itself, starting with "Date Rizz:".
 
-Return ONLY the JSON. Do not add any extra commentary or refusal text."""
+---
+### YOUR GOAL & CONTEXT
+You will analyze the transcript for "Date Rizz" based on key dating-relevant signals. Your analysis *must* be rooted in these signals:
+
+1.  **Reciprocity & Turn-Taking**:
+    * Is talk time balanced?
+    * Is the interruption rate low?
+    * Are back-channels (e.g., "mm-hmm," "yeah") timely and supportive?
+
+2.  **Attentiveness**:
+    * Is there a good question rate (not too high, not zero)?
+    * Are there follow-up questions that reference prior details?
+    * Does the speaker show memory of the other's preferences?
+
+3.  **Warmth**:
+    * Is the sentiment trajectory positive? Does the conversation get warmer?
+    * Are there positive acknowledgments (e.g., "That's great," "Awesome")?
+    * Are there appreciation phrases (e.g., "Thanks for sharing")?
+
+4.  **Comfort & Pacing**:
+    * Is the speaking rate stable and natural, not rushed or hesitant?
+    * Is there good pause tolerance? Are silences comfortable or awkward?
+    * Are there markers of lightness, like laughter?
+
+5.  **Boundary Respect**:
+    * Does the speaker honor topics the other person avoids?
+    * Do they avoid pushing after a "no" or a clear signal of discomfort?
+
+---
+### HOW TO COMPUTE THE SCORE
+1.  Analyze the transcript for all 5 signals. Normalize them per speaker and by the conversation's length.
+2.  Map your findings into 0-100 sub-scores for the 5 key signals.
+3.  Aggregate these into a final 0-100 "Date Rizz" score.
+4.  Also generate a 0-100 "AI Confidence" score based on how much data you had (a short transcript = low confidence).
+
+---
+### REQUIRED OUTPUT FORMAT (POST-DATE MODE)
+You *must* return your full analysis in this *exact* plain-text format:
+
+Date Rizz: [Your 0-100 aggregate score] — “[A short, catchy title for the conversation]”
+AI Confidence: [Your 0-100 confidence score]
+
+[Your 1-2 sentence human summary/overview of the conversation's dynamics]
+
+✅ Highlights:
+• [Your first analysis highlight]
+• [Your second analysis highlight]
+
+💡 Try:
+• [Your first improvement tip]
+• [Your second improvement tip]
+
+💬 Next time, try:
+• [Your first suggested prompt for a next date]
+• [Your second suggested prompt for a next date]
+
+---
+Breakdown:
+• Reciprocity: [Score 0-100] ([Brief analysis, e.g., "Good balance" or "You dominated"])
+• Attentiveness: [Score 0-100] ([Brief analysis, e.g., "Many good questions"])
+• Warmth: [Score 0-100] ([Brief analysis, e.g., "Very positive tone"])
+• Comfort: [Score 0-100] ([Brief analysis, e.g., "Easy pacing, no awkwardness"])
+• Boundary: [Score 0-100] ([Brief analysis, e.g., "Respectful topic handling"])
+---
+✨ Highlights Reel:
+• [Timestamp_s]: "[Quote from transcript]" - (Why this moment was strong)
+• [Timestamp_s]: "[Another quote]" - (Why this moment was strong)
+
+---
+*IMPORTANT: Even if the transcript is very short, you MUST do your best to generate this full report. State a low confidence score if the data is poor, but *always* provide the report in this exact format.*
+"""
 
 def deepseek_user_prompt(transcript_json: List[Dict[str, Any]], title_hint: Optional[str]) -> str:
-    schema = {
-        "title": "string (<= 80 chars; use first meaningful utterance if not provided)",
-        "confidence_score": "int 0-100 (See rubric for definition)",
-        "final_score": "int 0-100",
-        "subscores": {
-            "reciprocity": {"score": "int 0-100", "balance": "string", "interruptions": "int", "backchannels": "int"},
-            "attentiveness": {"score": "int 0-100", "question_rate_per_min": "float", "followups": "int", "examples": ["string", "..."]},
-            "warmth": {"score": "int 0-100", "sentiment_trend": "one of ['up','down','flat']", "positives": "int", "examples": ["string", "..."]},
-            "comfort": {"score": "int 0-100", "avg_pause_s": "float", "speaking_rate_cv": "float", "laughter_count": "int"},
-            "boundary": {"score": "int 0-100", "events": "int", "pushes_after_no": "int", "examples": ["string", "..."]},
-            "chemistry": {"score": "int 0-100", "qa_responsiveness": "float 0-1", "positivity_synchrony": "float 0-1"}
-        },
-        "highlights": ["string", "..."],
-        "improvements": ["string", "..."],
-        "highlights_reel": [
-            {"timestamp_s": "float", "text": "string", "why": "string"}
-        ],
-        "suggested_prompts": ["string", "..."],
-        "generated_at": "ISO-8601 datetime string in UTC"
-    }
-    rubric = {
-        "confidence_score": "A 0-100 score of your confidence in this analysis, based on the transcript's length and substance. 0-30 = Low confidence (very short/incomplete). 30-70 = Mid confidence (partial talk). 70-100 = High confidence (rich conversation).",
-        "normalization": "Consider total duration and #turns; avoid penalizing short talks.",
-        "aggregation": "Weighting guidance (can adapt): R=0.18, A=0.18, W=0.18, C=0.18, B=0.14, Ch=0.10. Clamp 0–100.",
-        "definitions": {
-            "followup": "Question referencing a partner detail or keyword from earlier.",
-            "backchannel": "Brief listener cue (mm-hmm, yeah, right).",
-            "boundary": "Respect for topic declines or explicit 'no'."
-        }
-    }
-    return json.dumps({
-        "title_hint": (title_hint or "")[:80],
-        "scoring_rubric": rubric,
-        "required_schema": schema,
-        "transcript": transcript_json
-    })
+    """Creates the simple user-prompt string with the transcript."""
+    transcript_str = json.dumps(transcript_json, indent=2)
+    return f"Title hint (you can ignore if you find a better one): {title_hint}\n\nTranscript:\n{transcript_str}"
 
-
-async def call_deepseek(messages, temperature=0.2, max_tokens=1500) -> Optional[dict]:
+async def call_deepseek(messages, temperature=0.2, max_tokens=2048) -> Optional[str]: # Returns Optional[str]
+    """
+    Calls the DeepSeek API and returns the raw text content string,
+    or None if it fails or returns empty content.
+    Increased max_tokens for the larger prompt.
+    """
     if not DEEPSEEK_API_KEY:
         print("❌ DeepSeek: DEEPSEEK_API_KEY is not set.")
         return None
@@ -161,13 +199,14 @@ async def call_deepseek(messages, temperature=0.2, max_tokens=1500) -> Optional[
         "model": DEEPSEEK_MODEL,
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": max_tokens
+        "max_tokens": max_tokens # Increased for the larger response
     }
     
     url = f"{DEEPSEEK_BASE_URL.rstrip('/')}/chat/completions"
     for attempt in range(3):
         try:
-            resp = await http_client.post(url, headers=headers, json=payload, timeout=200.0)
+            # Increased timeout for a potentially longer generation
+            resp = await http_client.post(url, headers=headers, json=payload, timeout=200.0) 
         except httpx.ReadTimeout:
             print(f"❌ DeepSeek timeout (attempt {attempt+1})")
             continue
@@ -183,36 +222,31 @@ async def call_deepseek(messages, temperature=0.2, max_tokens=1500) -> Optional[
                 continue
             return None
 
-        # --- START ROBUST PARSING FIX ---
+        # --- MODIFIED: Return raw string, not JSON ---
         try:
             data = resp.json()
             choice = data.get("choices", [{}])[0]
             message = choice.get("message", {})
-            content = message.get("content")
+            content = message.get("content") # This is now the raw string we want
 
-            # Check if content is None or an empty string
+            # Check if content is None or an empty string (the original problem)
             if not content:
                 reasoning = message.get("reasoning_content", "No reasoning provided.")
                 finish_reason = choice.get("finish_reason", "No finish reason.")
                 print(f"❌ DeepSeek: Returned empty content. FinishReason: {finish_reason}. Reasoning: {reasoning[:500]}")
                 return None
 
-            # Content exists, now try to parse it
-            return json.loads(content)
+            # Return the raw, formatted string content
+            return content.strip()
         
-        except json.JSONDecodeError as e:
-            # Content was not empty, but it wasn't valid JSON
-            print(f"❌ Parse error (JSONDecodeError): {e}. Content preview: {content[:400]}")
-            return None
         except Exception as e:
-            # Other errors (e.g., KeyError if response structure is wrong)
+            # Catch JSONDecodeError if resp.json() fails, or KeyError if structure is wrong
             print(f"❌ Parse error (generic): {e}. Full response preview: {resp.text[:400]}")
             return None
-        # --- END ROBUST PARSING FIX ---
+        # --- END MODIFICATION ---
 
     print("❌ DeepSeek: retries exhausted.")
-    return None # Explicitly return None after retries
-
+    return None
 
 @app.get("/deepseek/ping")
 async def deepseek_ping():
@@ -220,13 +254,17 @@ async def deepseek_ping():
         {"role":"system","content":"Return ONLY {\"ok\":true,\"ts\":\"<utc>\"}."},
         {"role":"user","content":"Respond with ok=true and current UTC timestamp."}
     ]
-    out = await call_deepseek(msgs, temperature=0.0, max_tokens=64)
-    return {"bridge_ok": bool(out), "raw": out}
+    out_str = await call_deepseek(msgs, temperature=0.0, max_tokens=64)
+    return {"bridge_ok": bool(out_str and "ok" in out_str), "raw": out_str}
 
 # =========================
 # Push helpers
 # =========================
 async def send_notification(uid: str, title: str, body: str):
+    """
+    Sends a push notification. The 'title' is a generic header,
+    and 'body' is the full, formatted report from the LLM.
+    """
     print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) Attempting push to uid={uid}")
     if not OMI_APP_ID or not OMI_APP_SECRET:
         print("❌ CRITICAL ERROR: OMI_APP_ID or OMI_APP_SECRET is not set.")
@@ -236,6 +274,10 @@ async def send_notification(uid: str, title: str, body: str):
         return
         
     full_message = f"{title}: {body}"
+    
+    if len(full_message) > 500:
+        full_message = full_message[:497] + "…"
+
     url = f"https://api.omi.me/v2/integrations/{OMI_APP_ID}/notification"
     headers = {"Authorization": f"Bearer {OMI_APP_SECRET}", "Content-Type": "application/json", "Content-Length": "0"}
     params = {"uid": uid, "message": full_message}
@@ -251,78 +293,9 @@ async def send_notification(uid: str, title: str, body: str):
     except Exception as e:
         print(f"Error sending notification: {e}")
 
-def compose_notification_from_llm(llm_data: Dict[str, Any]) -> Tuple[str, str]:
-    """
-    Organizes the raw LLM response into a systematic report for notifications and memory.
-    Returns a (title, body) tuple.
-    """
-    
-    def truncate(s: str, n: int = 60) -> str:
-        return (s[:n].rstrip() + "…") if len(s) > n else s
-
-    # --- Extract data with defaults ---
-    title = truncate(llm_data.get("title", "Conversation Report"))
-    final_score = llm_data.get("final_score", "N/A")
-    confidence = llm_data.get("confidence_score", "N/A")
-    
-    highlights = llm_data.get("highlights", ["No highlights provided."])
-    improvements = llm_data.get("improvements", ["No improvements provided."])
-    prompts = llm_data.get("suggested_prompts", ["No prompts provided."])
-    subscores = llm_data.get("subscores", {})
-
-    # --- Build Body String ---
-    body_lines = []
-    body_lines.append(f"Date Rizz: {final_score}/100 — “{title}”")
-    body_lines.append(f"AI Confidence: {confidence}/100")
-    
-    # --- Subscores ---
-    sub_list = []
-    if "reciprocity" in subscores:
-        sub_list.append(f"R {subscores['reciprocity'].get('score', 'N/A')}")
-    if "attentiveness" in subscores:
-        sub_list.append(f"A {subscores['attentiveness'].get('score', 'N/A')}")
-    if "warmth" in subscores:
-        sub_list.append(f"W {subscores['warmth'].get('score', 'N/A')}")
-    if "comfort" in subscores:
-        sub_list.append(f"C {subscores['comfort'].get('score', 'N/A')}")
-    if "boundary" in subscores:
-        sub_list.append(f"B {subscores['boundary'].get('score', 'N/A')}")
-    if "chemistry" in subscores:
-        sub_list.append(f"Ch {subscores['chemistry'].get('score', 'N/A')}")
-    
-    if sub_list:
-        body_lines.append(" · ".join(sub_list))
-
-    # --- Highlights ---
-    body_lines.append("\n✅ Highlights:")
-    for h in highlights:
-        body_lines.append(f"• {h}")
-
-    # --- Improvements ---
-    body_lines.append("\n💡 Try:")
-    for i in improvements:
-        body_lines.append(f"• {i}")
-
-    # --- Prompts ---
-    body_lines.append("\n💬 Next time, try:")
-    for p in prompts:
-        body_lines.append(f"• {p}")
-        
-    # --- Join and truncate ---
-    final_body = "\n".join(body_lines)
-    
-    # Return the user-facing title and the full body
-    report_title = f"Your Rizz Report: {final_score}/100 for “{title}”"
-    
-    if len(final_body) > 500:
-        # Fallback for very long reports to fit push notification limits
-        return (report_title, final_body[:497] + "…")
-    
-    return (report_title, final_body)
-
 async def save_text_as_memory(uid: str, text_content: str):
     """
-    Saves a plain text string as a new memory in Omi.
+    Saves the raw, formatted LLM report as a new memory in Omi.
     """
     print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) Attempting to save memory for uid={uid}")
     if not OMI_APP_ID or not OMI_APP_SECRET:
@@ -339,7 +312,7 @@ async def save_text_as_memory(uid: str, text_content: str):
     }
     params = {"uid": uid}
     payload = {
-        "text": text_content,
+        "text": text_content, # The text_content *is* the full report
         "app_id": OMI_APP_ID
     }
 
@@ -373,14 +346,10 @@ CONVS: Dict[str, ConvState] = {}
 CONVS_LOCK = asyncio.Lock()
 
 def _normalize_speaker(seg: RTIncomingSegment) -> str:
-    if seg.is_user is True:
-        return "You"
-    if seg.is_user is False:
-        return "Partner"
-    if seg.speaker is not None:
-        return seg.speaker
-    if seg.speaker_id is not None:
-        return f"SPEAKER_{seg.speaker_id}"
+    if seg.is_user is True: return "You"
+    if seg.is_user is False: return "Partner"
+    if seg.speaker is not None: return seg.speaker
+    if seg.speaker_id is not None: return f"SPEAKER_{seg.speaker_id}"
     return "Unknown"
 
 def _rt_to_internal(seg: RTIncomingSegment) -> TranscriptSegment:
@@ -404,9 +373,12 @@ async def _get_state(uid: str) -> ConvState:
         return CONVS[uid]
 
 # =========================
-# Finalization (LLM-Only)
+# Finalization (LLM-Only, Direct-to-String)
 # =========================
-async def llm_analyze(segments: List[TranscriptSegment], title_hint: Optional[str]) -> Optional[Dict[str, Any]]:
+async def llm_analyze(segments: List[TranscriptSegment], title_hint: Optional[str]) -> Optional[str]:
+    """
+    Calls the LLM and returns the raw formatted string report.
+    """
     if not segments:
         return None
     transcript_json = prepare_transcript_for_llm(segments)
@@ -414,6 +386,7 @@ async def llm_analyze(segments: List[TranscriptSegment], title_hint: Optional[st
         {"role": "system", "content": DEEPSEEK_SYSTEM_PROMPT},
         {"role": "user", "content": deepseek_user_prompt(transcript_json, title_hint)}
     ]
+    # call_deepseek now returns a string
     return await call_deepseek(messages)
 
 async def _finalize_and_analyze(uid: str) -> Dict:
@@ -440,30 +413,30 @@ async def _finalize_and_analyze_UNLOCKED(state: ConvState, uid: str) -> Dict:
         summary = {"status": "error", "message": "Not enough segments to analyze."}
     else:
         # --- LLM-Only Analysis ---
-        llm = await llm_analyze(clean_segments, title)
+        llm_report_string = await llm_analyze(clean_segments, title) # This is now a string
         
-        if llm:
-            # Generate notification body *directly* from LLM response
-            report_title, report_body = compose_notification_from_llm(llm)
+        if llm_report_string:
+            # The LLM's full, formatted report is the BODY
+            report_title = "Your Rizz Report is Ready" # Generic title
+            report_body = llm_report_string           # Full LLM output
             
             push_uid = state.last_uid or uid
             if push_uid:
-                score = llm.get('final_score', 'N/A')
-                print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 📣 Pushing (LLM-Only) to uid='{push_uid}', score={score}")
+                print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 📣 Pushing (LLM-String) to uid='{push_uid}'")
                 
-                # Use the generated title and body for notification and memory
+                # Send notification (title + body)
                 await send_notification(push_uid, title=report_title, body=report_body)
-                await save_text_as_memory(push_uid, report_body)
+                # Save memory (just the body)
+                await save_text_as_memory(push_uid, report_body) 
 
-            # The summary returned by the API is now just the LLM JSON
             summary = {
                 "status": "success",
-                "summary": llm  # Return the whole LLM blob
+                "summary": {"report": report_body} # Return the report string
             }
         else:
-            # This 'else' now means the LLM call *failed* (network, parse error, etc.)
+            # This 'else' now means the LLM call *failed* (network, parse error, empty)
             print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ⚠️ LLM unavailable. No analysis performed.")
-            summary = {"status": "error", "message": "LLM analysis failed and no fallback is configured."}
+            summary = {"status": "error", "message": "LLM analysis failed."}
 
     # Reset state
     state.active = False
