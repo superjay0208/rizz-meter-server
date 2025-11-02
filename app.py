@@ -27,6 +27,11 @@ IDLE_TIMEOUT_SEC = int(os.environ.get("IDLE_TIMEOUT_SEC", "180"))
 MAX_SEG_GAP_SEC = float(os.environ.get("MAX_SEG_GAP_SEC", "120"))
 PID = os.getpid()
 
+# Silence/Nudge knobs
+SILENCE_HINT_SEC   = int(os.environ.get("SILENCE_HINT_SEC", "20"))     # when to nudge
+BUZZ_COOLDOWN_SEC  = int(os.environ.get("BUZZ_COOLDOWN_SEC", "120"))   # avoid spam
+NUDGE_MAX_CHARS    = int(os.environ.get("NUDGE_MAX_CHARS", "160"))     # short push text
+
 # Markers
 START_RE = re.compile(r"\bconversation\s*starts\b", re.I)
 END_RE   = re.compile(r"\bconversa(?:i?t)ion\s*end(?:s)?\b", re.I)
@@ -94,7 +99,7 @@ def prepare_transcript_for_llm(segments: List[TranscriptSegment]) -> List[Dict[s
         if s.text and s.text.strip()
     ]
 
-# --- NEW METICULOUS PROMPT WITH FULL CONTEXT ---
+# --- MAIN REPORT PROMPT ---
 DEEPSEEK_SYSTEM_PROMPT = """You are an expert social-conversation analyst, specializing in dating.
 Your job is to read a transcript and return a single, formatted, plain-text "Post-Date Report".
 
@@ -173,16 +178,37 @@ Breakdown:
 *IMPORTANT: Even if the transcript is very short, you MUST do your best to generate this full report. State a low confidence score if the data is poor, but *always* provide the report in this exact format.*
 """
 
+# --- NUDGE & PROFILE PROMPTS ---
+DEEPSEEK_NUDGE_SYSTEM_PROMPT = """You are a concise conversation coach.
+Given a partial date transcript, respond with ONE line (<= {max_chars} chars) suggesting 2–3 adjacent topics.
+Format: Try: topic1 • topic2 • topic3
+Keep it specific to their chat so far. No extra text."""
+DEEPSEEK_PROFILE_SYSTEM_PROMPT = """Extract a partner profile from a date transcript.
+Return ONLY minified JSON with these keys:
+{
+  "name": null|string,
+  "birthday": null|string,
+  "hobbies": string[],
+  "likes": string[],
+  "dislikes": string[],
+  "work": null|string,
+  "location": null|string,
+  "values": string[],
+  "green_flags": string[],
+  "red_flags": string[],
+  "other_facts": string[]
+}
+If unknown, use null or []. No commentary. Only JSON."""
+
 def deepseek_user_prompt(transcript_json: List[Dict[str, Any]], title_hint: Optional[str]) -> str:
     """Creates the simple user-prompt string with the transcript."""
     transcript_str = json.dumps(transcript_json, indent=2)
     return f"Title hint (you can ignore if you find a better one): {title_hint}\n\nTranscript:\n{transcript_str}"
 
-async def call_deepseek(messages, temperature=0.2, max_tokens=2048) -> Optional[str]: # Returns Optional[str]
+async def call_deepseek(messages, temperature=0.2, max_tokens=2048) -> Optional[str]:
     """
     Calls the DeepSeek API and returns the raw text content string,
     or None if it fails or returns empty content.
-    Increased max_tokens for the larger prompt.
     """
     if not DEEPSEEK_API_KEY:
         print("❌ DeepSeek: DEEPSEEK_API_KEY is not set.")
@@ -199,14 +225,13 @@ async def call_deepseek(messages, temperature=0.2, max_tokens=2048) -> Optional[
         "model": DEEPSEEK_MODEL,
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": max_tokens # Increased for the larger response
+        "max_tokens": max_tokens
     }
-    
     url = f"{DEEPSEEK_BASE_URL.rstrip('/')}/chat/completions"
+
     for attempt in range(3):
         try:
-            # Increased timeout for a potentially longer generation
-            resp = await http_client.post(url, headers=headers, json=payload, timeout=200.0) 
+            resp = await http_client.post(url, headers=headers, json=payload, timeout=200.0)
         except httpx.ReadTimeout:
             print(f"❌ DeepSeek timeout (attempt {attempt+1})")
             continue
@@ -222,28 +247,23 @@ async def call_deepseek(messages, temperature=0.2, max_tokens=2048) -> Optional[
                 continue
             return None
 
-        # --- MODIFIED: Return raw string, not JSON ---
         try:
             data = resp.json()
             choice = data.get("choices", [{}])[0]
             message = choice.get("message", {})
-            content = message.get("content") # This is now the raw string we want
+            content = message.get("content")
 
-            # Check if content is None or an empty string (the original problem)
             if not content:
                 reasoning = message.get("reasoning_content", "No reasoning provided.")
                 finish_reason = choice.get("finish_reason", "No finish reason.")
                 print(f"❌ DeepSeek: Returned empty content. FinishReason: {finish_reason}. Reasoning: {reasoning[:500]}")
                 return None
 
-            # Return the raw, formatted string content
             return content.strip()
-        
+
         except Exception as e:
-            # Catch JSONDecodeError if resp.json() fails, or KeyError if structure is wrong
             print(f"❌ Parse error (generic): {e}. Full response preview: {resp.text[:400]}")
             return None
-        # --- END MODIFICATION ---
 
     print("❌ DeepSeek: retries exhausted.")
     return None
@@ -258,12 +278,20 @@ async def deepseek_ping():
     return {"bridge_ok": bool(out_str and "ok" in out_str), "raw": out_str}
 
 # =========================
+# Token helper (Imports)
+# =========================
+def _get_imports_token() -> Optional[str]:
+    """
+    Imports (create conversation/memories) expect an API key (sk_...).
+    If you haven't split creds yet, we fall back to OMI_APP_SECRET.
+    """
+    return os.environ.get("OMI_API_KEY") or os.environ.get("OMI_APP_SECRET")
+
+# =========================
 # Push helpers
 # =========================
-
-
 async def create_conversation(uid: str, text: str):
-    api_key = os.environ.get("OMI_API_KEY")
+    api_key = _get_imports_token()
     if not OMI_APP_ID or not api_key or not http_client:
         return
 
@@ -275,7 +303,6 @@ async def create_conversation(uid: str, text: str):
         "text_source": "other_text",
         "text_source_spec": "rizz_meter_report",
         "language": "en"
-        # optionally: started_at / finished_at in ISO 8601
     }
     resp = await http_client.post(url, headers=headers, params=params, json=payload, timeout=30.0)
     if 200 <= resp.status_code < 300:
@@ -283,28 +310,24 @@ async def create_conversation(uid: str, text: str):
     else:
         print(f"❌ Failed to create conversation. {resp.status_code} {resp.text}")
 
-
-
-# --- Notifications: keep using App Secret (per docs) ---
+# Notifications: keep using App Secret (per docs)
 async def send_notification(uid: str, title: str, body: str):
     print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) Attempting push to uid={uid}")
     if not OMI_APP_ID or not OMI_APP_SECRET or not http_client:
         print("❌ Missing OMI creds or HTTP client.")
         return
 
-    # keep notifications short; device UI shows a preview
     full_message = f"{title}: {body}"
 
     url = f"https://api.omi.me/v2/integrations/{OMI_APP_ID}/notification"
     headers = {
         "Authorization": f"Bearer {OMI_APP_SECRET}",
         "Content-Type": "application/json",
-        "Content-Length": "0",            # per docs
+        "Content-Length": "0",
     }
     params = {"uid": uid, "message": full_message}
 
     try:
-        # no body => true zero-length request body
         resp = await http_client.post(url, headers=headers, params=params, timeout=15.0)
         if 200 <= resp.status_code < 300:
             print("✅ Notification sent.", resp.text)
@@ -313,18 +336,13 @@ async def send_notification(uid: str, title: str, body: str):
     except Exception as e:
         print(f"Error sending notification: {e}")
 
-
-# --- Imports: use API KEY (sk_...) and POST body with both text + memories ---
+# Imports: save LLM report as conversation + explicit memory
 async def save_text_as_memory(uid: str, text_content: str):
-    """
-    Save the LLM report as a conversation + an explicit memory.
-    Uses the Imports API with API KEY per docs.
-    """
     print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) Attempting to save memory for uid={uid}")
 
-    api_key = os.environ.get("OMI_APP_SECRET")
+    api_key = _get_imports_token()
     if not OMI_APP_ID or not api_key or not http_client:
-        print("❌ Missing OMI_APP_ID or OMI_API_KEY or HTTP client.")
+        print("❌ Missing OMI_APP_ID or Imports token or HTTP client.")
         return
 
     # (A) Create a conversation holding the full report text
@@ -333,7 +351,7 @@ async def save_text_as_memory(uid: str, text_content: str):
         conv_headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         conv_params = {"uid": uid}
         conv_payload = {
-            "text": text_content,                      # required by Create Conversation
+            "text": text_content,
             "text_source": "other_text",
             "text_source_spec": "rizz_meter_report",
             "language": "en",
@@ -357,8 +375,7 @@ async def save_text_as_memory(uid: str, text_content: str):
         memory_content = first_line[:300]  # keep memory concise
 
         mem_payload = {
-            # Include BOTH 'text' and 'memories' to satisfy validators and for future extraction
-            "text": text_content,                          # <- avoids 422 'text' missing
+            "text": text_content,
             "text_source": "other",
             "text_source_spec": "rizz_meter",
             "memories": [
@@ -379,6 +396,44 @@ async def save_text_as_memory(uid: str, text_content: str):
     except Exception as e:
         print(f"Error saving memory: {e}")
 
+# --- NEW: save partner profile memory ---
+async def save_partner_profile_memory(uid: str, profile: dict):
+    api_key = _get_imports_token()
+    if not OMI_APP_ID or not api_key or not http_client or not profile:
+        return
+
+    def _join(items):
+        return ", ".join([x for x in items if isinstance(x, str) and x.strip()]) if items else ""
+
+    summary = []
+    if profile.get("birthday"): summary.append(f"Birthday: {profile['birthday']}")
+    if _join(profile.get("hobbies")): summary.append(f"Hobbies: {_join(profile.get('hobbies'))}")
+    if _join(profile.get("likes")): summary.append(f"Likes: {_join(profile.get('likes'))}")
+    if _join(profile.get("dislikes")): summary.append(f"Dislikes: {_join(profile.get('dislikes'))}")
+    if profile.get("work"): summary.append(f"Work: {profile['work']}")
+    if profile.get("location"): summary.append(f"Location: {profile['location']}")
+    if _join(profile.get("values")): summary.append(f"Values: {_join(profile.get('values'))}")
+    content_line = "Partner profile — " + " | ".join(summary) if summary else "Partner profile — (minimal data)"
+
+    url = f"https://api.omi.me/v2/integrations/{OMI_APP_ID}/user/memories"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    params = {"uid": uid}
+    payload = {
+        "text": content_line,
+        "text_source": "other",
+        "text_source_spec": "rizz_meter_partner_profile",
+        "memories": [
+            {
+                "content": content_line,
+                "tags": ["partner_profile", "dating", "rizz_meter"]
+            }
+        ]
+    }
+    resp = await http_client.post(url, headers=headers, params=params, json=payload, timeout=30.0)
+    if 200 <= resp.status_code < 300:
+        print("✅ Partner profile memory saved.")
+    else:
+        print(f"❌ Partner profile memory failed. {resp.status_code} {resp.text}")
 
 # =========================
 # Per-uid state
@@ -392,6 +447,10 @@ class ConvState:
         self.last_wall_ts: float = 0.0
         self.last_seg_end: float = 0.0
         self.lock = asyncio.Lock()
+        # Silence-nudge
+        self.silence_task: Optional[asyncio.Task] = None
+        self.last_buzz_wall_ts: float = 0.0
+
     def touch_wall(self):
         self.last_wall_ts = datetime.now(timezone.utc).timestamp()
 
@@ -426,12 +485,50 @@ async def _get_state(uid: str) -> ConvState:
         return CONVS[uid]
 
 # =========================
-# Finalization (LLM-Only, Direct-to-String)
+# LLM analysis + nudges + profile extraction
 # =========================
+def _compact_transcript_text(segments: List[TranscriptSegment], max_chars: int = 1200) -> str:
+    parts = [f"{s.speaker}: {s.text.strip()}" for s in segments if s.text and s.text.strip()]
+    out = "\n".join(parts[-50:])
+    return out[-max_chars:]
+
+async def generate_topic_nudges(segments: List[TranscriptSegment], title_hint: Optional[str]) -> Optional[str]:
+    if not DEEPSEEK_API_KEY or not segments:
+        return None
+    body = _compact_transcript_text(segments, 1200)
+    sys = DEEPSEEK_NUDGE_SYSTEM_PROMPT.format(max_chars=NUDGE_MAX_CHARS)
+    messages = [
+        {"role": "system", "content": sys},
+        {"role": "user", "content": f"Title hint: {title_hint or 'Date'}\n\nTranscript:\n{body}"}
+    ]
+    text = await call_deepseek(messages, temperature=0.6, max_tokens=256)
+    if not text:
+        return None
+    line = text.strip().replace("\n", " ")
+    return line[:NUDGE_MAX_CHARS]
+
+async def extract_partner_profile(segments: List[TranscriptSegment]) -> Optional[dict]:
+    if not DEEPSEEK_API_KEY or not segments:
+        return None
+    tx = _compact_transcript_text(segments, 4000)
+    messages = [
+        {"role": "system", "content": DEEPSEEK_PROFILE_SYSTEM_PROMPT},
+        {"role": "user", "content": tx}
+    ]
+    raw = await call_deepseek(messages, temperature=0.0, max_tokens=768)
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        raw_clean = raw.strip().strip("`").strip()
+        try:
+            return json.loads(raw_clean)
+        except Exception:
+            print(f"⚠️ profile JSON parse failed. preview={raw[:200]}")
+            return None
+
 async def llm_analyze(segments: List[TranscriptSegment], title_hint: Optional[str]) -> Optional[str]:
-    """
-    Calls the LLM and returns the raw formatted string report.
-    """
     if not segments:
         return None
     transcript_json = prepare_transcript_for_llm(segments)
@@ -439,9 +536,44 @@ async def llm_analyze(segments: List[TranscriptSegment], title_hint: Optional[st
         {"role": "system", "content": DEEPSEEK_SYSTEM_PROMPT},
         {"role": "user", "content": deepseek_user_prompt(transcript_json, title_hint)}
     ]
-    # call_deepseek now returns a string
     return await call_deepseek(messages)
 
+# =========================
+# Silence monitor
+# =========================
+async def _silence_monitor(uid: str):
+    try:
+        while True:
+            await asyncio.sleep(3)
+            state = await _get_state(uid)
+            with_data: Optional[List[TranscriptSegment]] = None
+            title_hint: Optional[str] = None
+            now_ts = datetime.now(timezone.utc).timestamp()
+            async with state.lock:
+                if not state.active:
+                    break
+                silent_for = now_ts - (state.last_wall_ts or now_ts)
+                can_buzz = (now_ts - (state.last_buzz_wall_ts or 0.0)) >= BUZZ_COOLDOWN_SEC
+                if silent_for >= SILENCE_HINT_SEC and can_buzz and state.buffer:
+                    with_data = list(state.buffer[-10:])
+                    title_hint = state.title
+                    state.last_buzz_wall_ts = now_ts
+
+            if with_data:
+                suggestion = await generate_topic_nudges(with_data, title_hint)
+                if not suggestion:
+                    suggestion = "Try: weekend plans • favorite food • a recent movie/show"
+                await send_notification(uid, title="💡 Conversation nudge", body=suggestion)
+    except asyncio.CancelledError:
+        pass
+
+def _ensure_silence_monitor(state: ConvState, uid: str):
+    if (state.silence_task is None) or state.silence_task.done():
+        state.silence_task = asyncio.create_task(_silence_monitor(uid))
+
+# =========================
+# Finalization (LLM-Only, Direct-to-String)
+# =========================
 async def _finalize_and_analyze(uid: str) -> Dict:
     state = await _get_state(uid)
     async with state.lock:
@@ -460,37 +592,34 @@ async def _finalize_and_analyze_UNLOCKED(state: ConvState, uid: str) -> Dict:
 
     title = state.title or next((t[:60] for t in non_marker_texts()), "Conversation")
     clean_segments = [s for s in segs if not _is_start_marker(s.text) and not _is_end_marker(s.text)]
-    
+
     if len(clean_segments) < 2:
         print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ⚠️ Not enough segments to analyze (uid={uid}).")
         summary = {"status": "error", "message": "Not enough segments to analyze."}
     else:
-        # --- LLM-Only Analysis ---
-        llm_report_string = await llm_analyze(clean_segments, title) # This is now a string
-        
+        llm_report_string = await llm_analyze(clean_segments, title)
+
         if llm_report_string:
-            # The LLM's full, formatted report is the BODY
-            report_title = "Your Rizz Report is Ready" # Generic title
-            report_body = llm_report_string           # Full LLM output
-            
+            report_title = "Your Rizz Report is Ready"
+            report_body = llm_report_string
+
             push_uid = state.last_uid or uid
             if push_uid:
                 print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 📣 Pushing (LLM-String) to uid='{push_uid}'")
-                
-                # Send notification (title + body)
                 await send_notification(push_uid, title=report_title, body=report_body)
-                # Save memory (just the body)
                 await create_conversation(push_uid, report_body)
                 await save_text_as_memory(push_uid, report_body)
 
-                
+                # Extract + save partner profile memory
+                try:
+                    profile = await extract_partner_profile(clean_segments)
+                    if profile:
+                        await save_partner_profile_memory(push_uid, profile)
+                except Exception as e:
+                    print(f"⚠️ profile extraction/save error: {e}")
 
-            summary = {
-                "status": "success",
-                "summary": {"report": report_body} # Return the report string
-            }
+            summary = {"status": "success", "summary": {"report": report_body}}
         else:
-            # This 'else' now means the LLM call *failed* (network, parse error, empty)
             print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ⚠️ LLM unavailable. No analysis performed.")
             summary = {"status": "error", "message": "LLM analysis failed."}
 
@@ -501,6 +630,12 @@ async def _finalize_and_analyze_UNLOCKED(state: ConvState, uid: str) -> Dict:
     state.last_uid = None
     state.touch_wall()
     state.last_seg_end = 0.0
+    # stop silence monitor
+    task = state.silence_task
+    state.silence_task = None
+    if task and not task.done():
+        task.cancel()
+
     return summary
 
 # =========================
@@ -556,7 +691,9 @@ async def transcript_processed(
             state.buffer = []
             state.title = None
             state.last_seg_end = 0.0
+            state.last_buzz_wall_ts = 0.0
             print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🟢 conversation starts — buffering begins (uid={effective_uid})")
+            _ensure_silence_monitor(state, effective_uid)
 
         if not state.active:
             print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ⏸️ Batch ignored: conversation not started yet. (uid={effective_uid})")
@@ -599,7 +736,3 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     print(f"Starting Rizz Meter server on http://0.0.0.0:{port} (pid={PID})")
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
-
-
-
-
