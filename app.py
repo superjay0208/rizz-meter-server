@@ -435,6 +435,7 @@ def deepseek_user_prompt(transcript_json: List[Dict[str, Any]], title_hint: Opti
     })
 
 # <<< MODIFIED: CONVERTED TO ASYNC DEF >>>
+# <<< MODIFIED: CONVERTED TO ASYNC DEF >>>
 async def call_deepseek(messages: List[Dict[str, str]], temperature: float = 0.2, max_tokens: int = 1500) -> Optional[dict]:
     if not DEEPSEEK_API_KEY:
         print("❌ DEEPSEEK_API_KEY not set; skipping LLM call.")
@@ -455,22 +456,47 @@ async def call_deepseek(messages: List[Dict[str, str]], temperature: float = 0.2
         "max_tokens": max_tokens,
         "response_format": {"type": "json_object"}
     }
+    
+    # --- Start of New Robust Error Handling ---
+    
     try:
-        # <<< MODIFIED: Use await and httpx client >>>
-        resp = await http_client.post(url, headers=headers, json=payload, timeout=180.0)
+        # 1. Handle Network/API Call Errors
+        resp = await http_client.post(url, headers=headers, json=payload, timeout=200.0)
         
-        if resp.status_code // 100 != 2:
-            print(f"❌ DeepSeek error {resp.status_code}: {resp.text}")
-            return None
-        data = resp.json()
-        content = data["choices"][0]["message"]["content"]
-        return json.loads(content)
     except httpx.ReadTimeout:
         print("❌ DeepSeek call timed out.")
         return None
     except Exception as e:
-        print(f"❌ DeepSeek exception: {e}")
+        print(f"❌ DeepSeek network exception: {e}")
         return None
+
+    # 2. Handle API-level Errors (non-200 status)
+    if resp.status_code // 100 != 2:
+        print(f"❌ DeepSeek API error {resp.status_code}: {resp.text}")
+        return None
+    
+    # 3. Handle Response Structure Errors
+    try:
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+    except Exception as e:
+        print(f"❌ DeepSeek response structure error. Full response: {resp.text}")
+        print(f"Exception: {e}")
+        return None
+
+    # 4. Handle JSON Parsing Errors (This is your specific error)
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError as e:
+        print(f"❌ DeepSeek failed to return valid JSON. Error: {e}")
+        print(f"--- Model Output Start ---\n{content}\n--- Model Output End ---")
+        return None
+    except Exception as e:
+        print(f"❌ Unknown error parsing DeepSeek content. Error: {e}")
+        print(f"--- Model Output Start ---\n{content}\n--- Model Output End ---")
+        return None
+    
+    # --- End of New Robust Error Handling ---
 
 def transform_llm_to_metrics(llm: dict, fallback_segments: List[TranscriptSegment]) -> Tuple[Dict[str, Dict], int, List[str], List[str], Dict[str, Any]]:
     subs = llm.get("subscores", {})
@@ -921,4 +947,5 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     print(f"Starting Rizz Meter server on http://0.0.0.0:{port} (pid={PID})")
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
 
