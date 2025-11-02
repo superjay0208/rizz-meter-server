@@ -3,9 +3,10 @@ import re
 import math
 import asyncio
 import statistics
-import requests
+import requests # Still imported but not used for blocking calls
 import uvicorn
 import json
+import httpx   # <-- ADDED
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Tuple, Any
 from fastapi import FastAPI, Query
@@ -71,14 +72,23 @@ class RTTranscriptBatch(BaseModel):
     uid: Optional[str] = None
 
 # =========================
-# App lifespan (no NLP loading)
+# App lifespan (HTTP Client) <-- MODIFIED
 # =========================
+
+# Global HTTP client
+http_client: Optional[httpx.AsyncClient] = None
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global http_client
     print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🚀 Server starting up...")
+    # Initialize the client with a default timeout
+    http_client = httpx.AsyncClient(timeout=45.0)
     try:
         yield
     finally:
+        if http_client:
+            await http_client.aclose()
         print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 👋 Server shutting down...")
 
 app = FastAPI(title="Rizz Meter Server", lifespan=lifespan)
@@ -86,6 +96,9 @@ app = FastAPI(title="Rizz Meter Server", lifespan=lifespan)
 # =========================
 # Heuristics/utilities
 # =========================
+# ... (All synchronous helper functions like clamp01, words, analyze_reciprocity, etc.
+# ...  remain exactly the same. They are not shown here for brevity but are
+# ...  assumed to be present from your original code.)
 POSITIVE_WORDS = {
     "great","awesome","cool","love","amazing","thank you","thanks","wonderful","fantastic","appreciate"
 }
@@ -207,12 +220,6 @@ def analyze_followups(segments: List[TranscriptSegment]) -> Dict:
     return {"score": to_0_100(score), "followups": followups, "questions_checked": questions_checked, "rate": round(rate,2)}
 
 def analyze_sentiment(segments: List[TranscriptSegment]) -> Dict:
-    """
-    Lightweight heuristic ONLY — no external NLP.
-    - positivity proxy: presence of POSITIVE_WORDS / appreciation phrases
-    - laughter proxy: LAUGHTER_PATTERNS
-    - sentiment trend: linear fit over a simple per-segment score
-    """
     per_seg_scores: List[Tuple[float, float]] = []
     pos_tokens = 0
     laughs = 0
@@ -363,7 +370,6 @@ def summarize_strengths_and_tips(metrics: Dict[str, Dict]) -> Tuple[List[str], L
     if "FollowUps" in metrics and metrics["FollowUps"]["score"] < 60:
         tips.append("Reference their words: “Earlier you mentioned __—tell me more?”")
     return strengths[:2], tips[:2]
-
 # =========================
 # DeepSeek integration
 # =========================
@@ -428,10 +434,15 @@ def deepseek_user_prompt(transcript_json: List[Dict[str, Any]], title_hint: Opti
         "transcript": transcript_json
     })
 
-def call_deepseek(messages: List[Dict[str, str]], temperature: float = 0.2, max_tokens: int = 1500) -> Optional[dict]:
+# <<< MODIFIED: CONVERTED TO ASYNC DEF >>>
+async def call_deepseek(messages: List[Dict[str, str]], temperature: float = 0.2, max_tokens: int = 1500) -> Optional[dict]:
     if not DEEPSEEK_API_KEY:
         print("❌ DEEPSEEK_API_KEY not set; skipping LLM call.")
         return None
+    if not http_client:
+        print("❌ HTTP Client not initialized; skipping LLM call.")
+        return None
+        
     url = f"{DEEPSEEK_BASE_URL}/chat/completions"
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
@@ -445,13 +456,18 @@ def call_deepseek(messages: List[Dict[str, str]], temperature: float = 0.2, max_
         "response_format": {"type": "json_object"}
     }
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=45)
+        # <<< MODIFIED: Use await and httpx client >>>
+        resp = await http_client.post(url, headers=headers, json=payload)
+        
         if resp.status_code // 100 != 2:
             print(f"❌ DeepSeek error {resp.status_code}: {resp.text}")
             return None
         data = resp.json()
         content = data["choices"][0]["message"]["content"]
         return json.loads(content)
+    except httpx.ReadTimeout:
+        print("❌ DeepSeek call timed out.")
+        return None
     except Exception as e:
         print(f"❌ DeepSeek exception: {e}")
         return None
@@ -486,17 +502,24 @@ def transform_llm_to_metrics(llm: dict, fallback_segments: List[TranscriptSegmen
 # =========================
 # Push helpers
 # =========================
-def send_notification(uid: str, title: str, body: str):
+# <<< MODIFIED: CONVERTED TO ASYNC DEF >>>
+async def send_notification(uid: str, title: str, body: str):
     print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) Attempting push to uid={uid}")
     if not OMI_APP_ID or not OMI_APP_SECRET:
         print("❌ CRITICAL ERROR: OMI_APP_ID or OMI_APP_SECRET is not set.")
         return
+    if not http_client:
+        print("❌ HTTP Client not initialized; skipping notification.")
+        return
+        
     full_message = f"{title}: {body}"
     url = f"https://api.omi.me/v2/integrations/{OMI_APP_ID}/notification"
     headers = {"Authorization": f"Bearer {OMI_APP_SECRET}", "Content-Type": "application/json", "Content-Length": "0"}
     params = {"uid": uid, "message": full_message}
     try:
-        resp = requests.post(url, headers=headers, params=params, data="")
+        # <<< MODIFIED: Use await and httpx client >>>
+        resp = await http_client.post(url, headers=headers, params=params, data="")
+        
         if 200 <= resp.status_code < 300:
             print("✅ Notification sent.")
             print(f"Response: {resp.text}")
@@ -528,6 +551,42 @@ def compose_notification(title: str, final: int, metrics: Dict[str, Dict], stren
         f"💡 Try: {im}"
     )
     return body if len(body) <= 500 else f"Date Rizz {final}/100 — “{tsn}”. {breakdown}. Highlights: {hi}. Try: {im}"
+
+# <<< MODIFIED: CONVERTED TO ASYNC DEF >>>
+async def save_text_as_memory(uid: str, text_content: str):
+    """
+    Saves a plain text string as a new memory in Omi.
+    """
+    print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) Attempting to save memory for uid={uid}")
+    if not OMI_APP_ID or not OMI_APP_SECRET:
+        print("❌ CRITICAL ERROR: OMI_APP_ID or OMI_APP_SECRET is not set. Cannot save memory.")
+        return
+    if not http_client:
+        print("❌ HTTP Client not initialized; skipping memory save.")
+        return
+
+    url = "https://api.omi.me/v2/memories"
+    headers = {
+        "Authorization": f"Bearer {OMI_APP_SECRET}",
+        "Content-Type": "application/json"
+    }
+    params = {"uid": uid}
+    payload = {
+        "text": text_content,
+        "app_id": OMI_APP_ID
+    }
+
+    try:
+        # <<< MODIFIED: Use await and httpx client (with a specific 15s timeout) >>>
+        resp = await http_client.post(url, headers=headers, params=params, json=payload, timeout=15.0)
+        
+        if 200 <= resp.status_code < 300:
+            print(f"✅ Memory saved successfully. ID: {resp.json().get('id')}")
+        else:
+            print(f"❌ Failed to save memory. Status: {resp.status_code}")
+            print(f"Response body: {resp.text}")
+    except Exception as e:
+        print(f"Error saving memory: {e}")
 
 # =========================
 # Per-uid state
@@ -581,7 +640,8 @@ async def _get_state(uid: str) -> ConvState:
 # =========================
 # Finalization using LLM first (fallback to heuristics)
 # =========================
-def llm_analyze(segments: List[TranscriptSegment], title_hint: Optional[str]) -> Optional[Dict[str, Any]]:
+# <<< MODIFIED: CONVERTED TO ASYNC DEF >>>
+async def llm_analyze(segments: List[TranscriptSegment], title_hint: Optional[str]) -> Optional[Dict[str, Any]]:
     if not segments:
         return None
     transcript_json = prepare_transcript_for_llm(segments)
@@ -589,7 +649,8 @@ def llm_analyze(segments: List[TranscriptSegment], title_hint: Optional[str]) ->
         {"role": "system", "content": DEEPSEEK_SYSTEM_PROMPT},
         {"role": "user", "content": deepseek_user_prompt(transcript_json, title_hint)}
     ]
-    return call_deepseek(messages)
+    # <<< MODIFIED: Use await >>>
+    return await call_deepseek(messages)
 
 def fallback_analyze(clean_segments: List[TranscriptSegment]) -> Dict[str, Any]:
     reciprocity = analyze_reciprocity(clean_segments)
@@ -626,12 +687,15 @@ def fallback_analyze(clean_segments: List[TranscriptSegment]) -> Dict[str, Any]:
         }
     }
 
+# <<< MODIFIED: CONVERTED TO ASYNC DEF >>>
 async def _finalize_and_analyze(uid: str) -> Dict:
     state = await _get_state(uid)
     async with state.lock:
-        return _finalize_and_analyze_UNLOCKED(state, uid)
+        # <<< MODIFIED: Use await >>>
+        return await _finalize_and_analyze_UNLOCKED(state, uid)
 
-def _finalize_and_analyze_UNLOCKED(state: ConvState, uid: str) -> Dict:
+# <<< MODIFIED: CONVERTED TO ASYNC DEF >>>
+async def _finalize_and_analyze_UNLOCKED(state: ConvState, uid: str) -> Dict:
     segs = list(state.buffer)
     print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🔔 Finalizing uid={uid} with {len(segs)} segments")
 
@@ -648,14 +712,18 @@ def _finalize_and_analyze_UNLOCKED(state: ConvState, uid: str) -> Dict:
         print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ⚠️ Not enough segments to analyze (uid={uid}).")
         summary = {"status": "error", "message": "Not enough segments to analyze."}
     else:
-        llm = llm_analyze(clean_segments, title)
+        # <<< MODIFIED: Use await >>>
+        llm = await llm_analyze(clean_segments, title)
+        
         if llm:
             metrics, final_score, strengths, tips, extras = transform_llm_to_metrics(llm, clean_segments)
             body = compose_notification(title, final_score, metrics, strengths, tips)
             push_uid = state.last_uid or uid
             if push_uid:
                 print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 📣 Pushing (LLM) to uid='{push_uid}', score={final_score}")
-                send_notification(push_uid, title="Your Rizz Report is Ready", body=body)
+                # <<< MODIFIED: Use await >>>
+                await send_notification(push_uid, title="Your Rizz Report is Ready", body=body)
+                await save_text_as_memory(push_uid, body)
             summary = {
                 "status": "success",
                 "summary": {
@@ -731,19 +799,21 @@ async def transcript_processed(
     async with state.lock:
         now_ts = datetime.now(timezone.utc).timestamp()
 
-        # Soft auto-finalize on idle (previous active convo)
         if state.active and state.last_wall_ts and (now_ts - state.last_wall_ts > IDLE_TIMEOUT_SEC) and state.buffer:
             print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ⏰ Idle timeout (wall) for uid={effective_uid}. Auto-finalizing previous convo.")
-            _finalize_and_analyze_UNLOCKED(state, effective_uid)
+            # <<< MODIFIED: Use await >>>
+            await _finalize_and_analyze_UNLOCKED(state, effective_uid)
 
         if force_end:
             print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🛑 force_end received for uid={effective_uid}")
-            return _finalize_and_analyze_UNLOCKED(state, effective_uid)
+            # <<< MODIFIED: Use await >>>
+            return await _finalize_and_analyze_UNLOCKED(state, effective_uid)
 
         if has_start or force_start:
             if state.active and state.buffer:
                 print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🔄 start while active (uid={effective_uid}) — auto-finalizing previous.")
-                _finalize_and_analyze_UNLOCKED(state, effective_uid)
+                # <<< MODIFIED: Use await >>>
+                await _finalize_and_analyze_UNLOCKED(state, effective_uid)
             state.active = True
             state.buffer = []
             state.title = None
@@ -755,7 +825,6 @@ async def transcript_processed(
             state.touch_wall()
             return {"status": "ignored", "reason": "not_started", "pid": PID}
 
-        # Buffer and gap check
         audio_gap_trigger = False
         for seg in batch.segments or []:
             internal = _rt_to_internal(seg)
@@ -771,11 +840,13 @@ async def transcript_processed(
 
         if has_end:
             print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🟥 end marker detected — finalizing (uid={effective_uid})")
-            return _finalize_and_analyze_UNLOCKED(state, effective_uid)
+            # <<< MODIFIED: Use await >>>
+            return await _finalize_and_analyze_UNLOCKED(state, effective_uid)
 
         if audio_gap_trigger and state.buffer:
             print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ⏰ Large audio gap detected (> {MAX_SEG_GAP_SEC}s). Auto-finalizing (uid={effective_uid}).")
-            return _finalize_and_analyze_UNLOCKED(state, effective_uid)
+            # <<< MODIFIED: Use await >>>
+            return await _finalize_and_analyze_UNLOCKED(state, effective_uid)
 
         print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🔄 Buffering: total segments={len(state.buffer)} (uid={effective_uid})")
         return {"status": "buffering", "segments_buffered": len(state.buffer), "will_push_on_end": True, "pid": PID}
@@ -783,6 +854,7 @@ async def transcript_processed(
 @app.post("/conversation/end")
 async def conversation_end(uid: str = Query(...)):
     print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🛑 /conversation/end called for uid={uid}")
+    # <<< MODIFIED: Use await >>>
     return await _finalize_and_analyze(uid)
 
 @app.post("/memory_created")
@@ -792,12 +864,17 @@ async def analyze_memory(memory: Memory, uid: str):
     if len(segments) < 2:
         return {"status": "error", "message": "Not enough segments."}
 
-    # Prefer LLM; fallback to heuristics
-    llm = llm_analyze(segments, memory.structured.title)
+    # <<< MODIFIED: Use await >>>
+    llm = await llm_analyze(segments, memory.structured.title)
+    
     if llm:
         metrics, final_score, strengths, tips, extras = transform_llm_to_metrics(llm, segments)
         body = compose_notification(memory.structured.title, final_score, metrics, strengths, tips)
-        send_notification(uid, title="Your Rizz Report is Ready", body=body)
+        
+        # <<< MODIFIED: Use await >>>
+        await send_notification(uid, title="Your Rizz Report is Ready", body=body)
+        await save_text_as_memory(uid, body)
+        
         return {"status": "success", "summary": {
             "title": memory.structured.title,
             "final_score": final_score,
@@ -816,7 +893,8 @@ async def analyze_memory(memory: Memory, uid: str):
 
     # Fallback if LLM unavailable
     fb = fallback_analyze(segments)
-    send_notification(uid, title="Your Rizz Report is Ready", body=compose_notification(
+    
+    notification_body = compose_notification(
         fb["summary"]["title"], fb["summary"]["final_score"],
         {
             "Reciprocity": fb["summary"]["subscores"]["reciprocity"],
@@ -828,7 +906,12 @@ async def analyze_memory(memory: Memory, uid: str):
         },
         fb["summary"]["highlights"],
         fb["summary"]["improvements"]
-    ))
+    )
+    
+    # <<< MODIFIED: Use await >>>
+    await send_notification(uid, title="Your Rizz Report is Ready", body=notification_body)
+    await save_text_as_memory(uid, notification_body)
+    
     return fb
 
 # =========================
