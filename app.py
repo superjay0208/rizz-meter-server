@@ -457,7 +457,7 @@ async def call_deepseek(messages: List[Dict[str, str]], temperature: float = 0.2
     }
     try:
         # <<< MODIFIED: Use await and httpx client >>>
-        resp = await http_client.post(url, headers=headers, json=payload)
+        resp = await http_client.post(url, headers=headers, json=payload, timeout=180.0)
         
         if resp.status_code // 100 != 2:
             print(f"❌ DeepSeek error {resp.status_code}: {resp.text}")
@@ -921,3 +921,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     print(f"Starting Rizz Meter server on http://0.0.0.0:{port} (pid={PID})")
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
