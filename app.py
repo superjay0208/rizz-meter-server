@@ -71,40 +71,24 @@ class RTTranscriptBatch(BaseModel):
     uid: Optional[str] = None
 
 # =========================
-# Optional NLP (kept only for fallback)
+# App lifespan (no NLP loading)
 # =========================
-HF_PIPELINE = None
-VADER = None
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global HF_PIPELINE, VADER
     print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 🚀 Server starting up...")
     try:
-        from transformers import pipeline
-        HF_PIPELINE = pipeline("sentiment-analysis")
-        print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ✅ HF Pipeline loaded.")
-    except Exception as e:
-        print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ⚠️ HF pipeline not loaded: {e}")
-        HF_PIPELINE = None
-    try:
-        from nltk.sentiment import SentimentIntensityAnalyzer
-        VADER = SentimentIntensityAnalyzer()
-        print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ✅ VADER loaded.")
-    except Exception as e:
-        print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ⚠️ VADER not loaded: {e}")
-        VADER = None
-    yield
-    HF_PIPELINE = None
-    VADER = None
-    print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 👋 Server shutting down...")
+        yield
+    finally:
+        print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) 👋 Server shutting down...")
 
 app = FastAPI(title="Rizz Meter Server", lifespan=lifespan)
 
 # =========================
-# Heuristics/utilities (kept for fallback & helpers)
+# Heuristics/utilities
 # =========================
-POSITIVE_WORDS = {"great","awesome","cool","love","amazing","thank you","thanks","wonderful","fantastic","appreciate"}
+POSITIVE_WORDS = {
+    "great","awesome","cool","love","amazing","thank you","thanks","wonderful","fantastic","appreciate"
+}
 APPRECIATION_PATTERNS = [r"\b(thanks|thank you|appreciate|that’s great|so glad)\b"]
 LAUGHTER_PATTERNS = [r"\b(lol|haha|lmao|rofl|\[laughs\]|(ha){2,})\b"]
 BACKCHANNELS = {"yeah","uh-huh","mm-hmm","right","gotcha","i see","ok","okay","mhmm","yup"}
@@ -132,7 +116,6 @@ def avg(lst: List[float]) -> float:
 def safe_var(lst: List[float]) -> float:
     return statistics.pvariance(lst) if len(lst) >= 2 else 0.0
 
-# (your original heuristic analyzers preserved here for fallback only)
 def analyze_reciprocity(segments: List[TranscriptSegment]) -> Dict:
     talk_time: Dict[str, float] = {}
     for seg in segments:
@@ -145,7 +128,11 @@ def analyze_reciprocity(segments: List[TranscriptSegment]) -> Dict:
     tot = talk_time[a] + talk_time[b]
     balance = 0.5 if tot == 0 else talk_time[a]/tot
     reciprocity_score = 1 - min(1.0, abs(balance - 0.5) * 2)
-    return {"score": to_0_100(reciprocity_score), "balance": f"{a}: {round(balance*100)}% | {b}: {round((1-balance)*100)}%", "talk_time": talk_time}
+    return {
+        "score": to_0_100(reciprocity_score),
+        "balance": f"{a}: {round(balance*100)}% | {b}: {round((1-balance)*100)}%",
+        "talk_time": talk_time
+    }
 
 def analyze_interruptions(segments: List[TranscriptSegment]) -> Dict:
     interrupts = 0
@@ -200,9 +187,11 @@ def analyze_followups(segments: List[TranscriptSegment]) -> Dict:
     partner_keywords = _recent_keywords_by_speaker(segments, lookback=12)
     followups = 0
     questions_checked = 0
+
     def partner_of(spk: str) -> Optional[str]:
         others = {s.speaker for s in segments if s.speaker != spk}
         return next(iter(others)) if others else None
+
     for seg in segments:
         if not seg.text.strip().endswith("?"):
             continue
@@ -218,29 +207,22 @@ def analyze_followups(segments: List[TranscriptSegment]) -> Dict:
     return {"score": to_0_100(score), "followups": followups, "questions_checked": questions_checked, "rate": round(rate,2)}
 
 def analyze_sentiment(segments: List[TranscriptSegment]) -> Dict:
-    per_seg_scores = []
+    """
+    Lightweight heuristic ONLY — no external NLP.
+    - positivity proxy: presence of POSITIVE_WORDS / appreciation phrases
+    - laughter proxy: LAUGHTER_PATTERNS
+    - sentiment trend: linear fit over a simple per-segment score
+    """
+    per_seg_scores: List[Tuple[float, float]] = []
     pos_tokens = 0
     laughs = 0
     for seg in segments:
         txt = seg.text.strip()
-        s = 0.5
-        try:
-            if HF_PIPELINE:
-                res = HF_PIPELINE(txt[:512])[0]
-                label = res.get("label","NEUTRAL").upper()
-                score = float(res.get("score", 0.5))
-                s = score if "POS" in label else (1.0-score if "NEG" in label else 0.5)
-            elif VADER:
-                vs = VADER.polarity_scores(txt)
-                s = (vs["compound"] + 1.0)/2.0
-            else:
-                wl = txt.lower()
-                hits = sum(1 for w in POSITIVE_WORDS if w in wl)
-                s = clamp01(0.5 + 0.1*hits)
-        except Exception:
-            s = 0.5
+        wl = txt.lower()
+        hits = sum(1 for w in POSITIVE_WORDS if w in wl)
+        s = clamp01(0.5 + 0.1 * hits)
         per_seg_scores.append((seg.start, s))
-        pos_tokens += sum(1 for p in APPRECIATION_PATTERNS if re.search(p, txt.lower()))
+        pos_tokens += sum(1 for p in APPRECIATION_PATTERNS if re.search(p, wl))
         if contains_any(txt, LAUGHTER_PATTERNS):
             laughs += 1
     if not per_seg_scores:
@@ -250,14 +232,20 @@ def analyze_sentiment(segments: List[TranscriptSegment]) -> Dict:
     ys = [y for (_, y) in per_seg_scores]
     if len(xs) >= 2:
         xbar, ybar = avg(xs), avg(ys)
-        num = sum((x-xbar)*(y-ybar) for x,y in zip(xs,ys))
-        den = sum((x-xbar)**2 for x in xs) or 1e-9
-        slope = num/den
+        num = sum((x - xbar) * (y - ybar) for x, y in zip(xs, ys))
+        den = sum((x - xbar) ** 2 for x in xs) or 1e-9
+        slope = num / den
     else:
         slope = 0.0
     mean_pos = avg(ys)
-    warmth = clamp01(0.7*mean_pos + 0.2*clamp01(pos_tokens/3.0) + 0.1*clamp01(laughs/4.0))
-    return {"score": to_0_100(warmth), "mean_positivity": round(mean_pos, 3), "slope": round(slope, 4), "appreciation_count": pos_tokens, "laughter_count": laughs}
+    warmth = clamp01(0.7 * mean_pos + 0.2 * clamp01(pos_tokens / 3.0) + 0.1 * clamp01(laughs / 4.0))
+    return {
+        "score": to_0_100(warmth),
+        "mean_positivity": round(mean_pos, 3),
+        "slope": round(slope, 4),
+        "appreciation_count": pos_tokens,
+        "laughter_count": laughs,
+    }
 
 def analyze_comfort(segments: List[TranscriptSegment]) -> Dict:
     pauses = []
@@ -312,9 +300,11 @@ def analyze_chemistry(segments: List[TranscriptSegment]) -> Dict:
                     q_answered += 1
                     break
     resp_rate = 0 if q_asked == 0 else q_answered/q_asked
+
     def is_pos_like(t: str) -> bool:
         t = t.lower()
         return contains_any(t, LAUGHTER_PATTERNS) or any(w in t for w in POSITIVE_WORDS)
+
     sync_events = 0
     sync_hits = 0
     for i, seg in enumerate(segments):
@@ -328,8 +318,10 @@ def analyze_chemistry(segments: List[TranscriptSegment]) -> Dict:
     score = clamp01(0.6*resp_rate + 0.4*sync_rate)
     return {"score": to_0_100(score), "qa_responsiveness": round(resp_rate,2), "positivity_synchrony": round(sync_rate,2)}
 
-WEIGHTS = {"Reciprocity": 0.18, "Attentiveness": 0.18, "Warmth": 0.18, "Comfort": 0.18, "Boundary": 0.14, "Chemistry": 0.10,
-           "Interruptions": 0.0, "Backchannels": 0.0, "FollowUps": 0.0}
+WEIGHTS = {
+    "Reciprocity": 0.18, "Attentiveness": 0.18, "Warmth": 0.18, "Comfort": 0.18, "Boundary": 0.14, "Chemistry": 0.10,
+    "Interruptions": 0.0, "Backchannels": 0.0, "FollowUps": 0.0
+}
 
 def compute_final_score(metrics: Dict[str, Dict]) -> int:
     total = 0.0
@@ -401,7 +393,6 @@ Provide 3–5 “suggested_prompts” to use next time.
 Return ONLY JSON following the exact schema. No extra commentary."""
 
 def deepseek_user_prompt(transcript_json: List[Dict[str, Any]], title_hint: Optional[str]) -> str:
-    # We embed rubric + schema + data. The model must return strict JSON.
     schema = {
         "title": "string (<= 80 chars; use first meaningful utterance if not provided)",
         "final_score": "int 0-100",
@@ -466,10 +457,6 @@ def call_deepseek(messages: List[Dict[str, str]], temperature: float = 0.2, max_
         return None
 
 def transform_llm_to_metrics(llm: dict, fallback_segments: List[TranscriptSegment]) -> Tuple[Dict[str, Dict], int, List[str], List[str], Dict[str, Any]]:
-    """
-    Map LLM JSON into the same metric dictionary your app expects.
-    Also return final_score, highlights, improvements, and passthrough extras.
-    """
     subs = llm.get("subscores", {})
     def pull(name, default=50):
         return int(subs.get(name, {}).get("score", default))
@@ -481,8 +468,7 @@ def transform_llm_to_metrics(llm: dict, fallback_segments: List[TranscriptSegmen
         "Comfort": {"score": pull("comfort"), **{k:v for k,v in subs.get("comfort", {}).items() if k != "score"}},
         "Boundary": {"score": pull("boundary"), **{k:v for k,v in subs.get("boundary", {}).items() if k != "score"}},
         "Chemistry": {"score": pull("chemistry"), **{k:v for k,v in subs.get("chemistry", {}).items() if k != "score"}},
-        # Support signals (optional)
-        "Interruptions": {"score": 100},  # can be filled from LLM if provided
+        "Interruptions": {"score": 100},
         "Backchannels": {"score": 100},
         "FollowUps": {"score": 100},
     }
@@ -498,7 +484,7 @@ def transform_llm_to_metrics(llm: dict, fallback_segments: List[TranscriptSegmen
     return metrics, final_score, highlights, improvements, extras
 
 # =========================
-# Push helpers (unchanged)
+# Push helpers
 # =========================
 def send_notification(uid: str, title: str, body: str):
     print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) Attempting push to uid={uid}")
@@ -662,7 +648,6 @@ def _finalize_and_analyze_UNLOCKED(state: ConvState, uid: str) -> Dict:
         print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ⚠️ Not enough segments to analyze (uid={uid}).")
         summary = {"status": "error", "message": "Not enough segments to analyze."}
     else:
-        # 1) Try LLM
         llm = llm_analyze(clean_segments, title)
         if llm:
             metrics, final_score, strengths, tips, extras = transform_llm_to_metrics(llm, clean_segments)
@@ -697,7 +682,6 @@ def _finalize_and_analyze_UNLOCKED(state: ConvState, uid: str) -> Dict:
                 }
             }
         else:
-            # 2) Fallback heuristics if LLM fails
             print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) ⚠️ LLM unavailable — using fallback heuristics.")
             summary = fallback_analyze(clean_segments)
 
