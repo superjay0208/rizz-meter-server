@@ -296,6 +296,7 @@ async def send_notification(uid: str, title: str, body: str):
 async def save_text_as_memory(uid: str, text_content: str):
     """
     Saves the raw, formatted LLM report as a new memory in Omi.
+    This version uses PUT and a real JSON body, as implied by the 405 error.
     """
     print(f"[{datetime.now(timezone.utc).isoformat()}] (pid={PID}) Attempting to save memory for uid={uid}")
     if not OMI_APP_ID or not OMI_APP_SECRET:
@@ -305,30 +306,40 @@ async def save_text_as_memory(uid: str, text_content: str):
         print("❌ HTTP Client not initialized; skipping memory save.")
         return
 
-    # --- START FIX ---
-    # The URL must match the integration pattern, just like the notification call
+    # The URL from the last fix was correct.
     url = f"https://api.omi.me/v2/integrations/{OMI_APP_ID}/memories"
-    # --- END FIX ---
 
+    # --- START FIX ---
+
+    # 1. Use standard headers for a JSON payload.
+    #    (We remove 'Content-Length: 0')
     headers = {
         "Authorization": f"Bearer {OMI_APP_SECRET}",
         "Content-Type": "application/json"
     }
     
-    # This part remains the same:
-    # We pass the 'uid' as a query parameter
+    # 2. Pass 'uid' as a query parameter (common for integrations)
     params = {"uid": uid}
     
-    # We pass the 'text' (and optionally app_id) in the JSON body
+    # 3. Pass the 'text' and 'app_id' in the JSON BODY.
+    #    This is standard for PUT/POST, and different from the notification call.
     payload = {
-        "text": text_content, 
+        "text": text_content,
         "app_id": OMI_APP_ID
     }
 
     try:
-        # The httpx client correctly sends 'params' in the URL 
-        # and 'json' as the POST body.
-        resp = await http_client.post(url, headers=headers, params=params, json=payload, timeout=15.0)
+        # 4. Use the PUT verb, not POST.
+        #    We send 'params' for the URL and 'json' for the body.
+        resp = await http_client.put(
+            url, 
+            headers=headers, 
+            params=params, 
+            json=payload,  # <-- Send a real JSON body
+            timeout=15.0
+        )
+        
+    # --- END FIX ---
         
         if 200 <= resp.status_code < 300:
             print(f"✅ Memory saved successfully. ID: {resp.json().get('id')}")
@@ -554,4 +565,5 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     print(f"Starting Rizz Meter server on http://0.0.0.0:{port} (pid={PID})")
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
 
